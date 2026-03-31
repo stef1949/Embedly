@@ -13,6 +13,7 @@ from config import load_config
 from utils.urls import rewrite_twitter_urls, validate_tiktok_url as validate_tiktok_url_safe, validate_instagram_url as validate_instagram_url_safe
 from services.transcode import compress_video_to_limit as compress_video_to_limit_safe
 from views import MessageControlView, TikTokControlView, InstagramControlView, configure_view_context
+from runtime_state import RuntimeState
 
 # Configure logging to show the time, logger name, level, and message.
 logging.basicConfig(
@@ -43,7 +44,7 @@ INSTAGRAM_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:instagram\.com|instagr
 
 # Rate limiting configuration (per user)
 RATE_LIMIT_SECONDS = CONFIG.rate_limit_seconds
-user_rate_limit = {}  # Dictionary mapping user ID to last processed timestamp
+runtime_state = RuntimeState()
 
 # User preferences for emulation (True = emulate user, False = post as bot)
 user_emulation_preferences = {}  # Maps user ID to boolean preference
@@ -56,7 +57,6 @@ version = "1.2.2"  # Bot version
 
 # Security settings
 GLOBAL_RATE_LIMIT = CONFIG.global_rate_limit_per_minute  # Maximum requests per minute across all users
-global_request_timestamps = []  # List of timestamps for global rate limiting
 BANNED_USERS = set()  # Set of banned user IDs
 SERVER_BLACKLIST = set()  # Set of blacklisted server IDs
 ADMIN_IDS = set()  # Set of bot admin user IDs
@@ -76,16 +76,7 @@ persistent_views_registered = False
 # Utility functions for security
 def check_global_rate_limit():
     """Check if the global rate limit has been exceeded"""
-    now = time.time()
-    # Remove timestamps older than 60 seconds
-    global global_request_timestamps
-    global_request_timestamps = [ts for ts in global_request_timestamps if now - ts < 60]
-    # Check if we've exceeded the global rate limit
-    if len(global_request_timestamps) >= GLOBAL_RATE_LIMIT:
-        return False
-    # Add current timestamp and return True (not rate limited)
-    global_request_timestamps.append(now)
-    return True
+    return runtime_state.allow_global_request(GLOBAL_RATE_LIMIT)
 
 def is_user_banned(user_id):
     """Check if a user is banned from using the bot"""
@@ -894,9 +885,7 @@ async def security_maintenance():
             
             # Prune old rate limit data
             now = time.time()
-            for user_id in list(user_rate_limit.keys()):
-                if now - user_rate_limit[user_id] > 3600:  # Remove entries older than 1 hour
-                    del user_rate_limit[user_id]
+            runtime_state.prune_user_entries(older_than_seconds=3600, now=now)
             
             # Wait for 1 hour before the next run
             await asyncio.sleep(3600)
@@ -1011,12 +1000,9 @@ async def on_message(message):
         spoiler_urls = rewrite_result.spoiler_urls
         non_spoiler_urls = rewrite_result.rewritten_urls
         
-        now = time.time()
-        last_time = user_rate_limit.get(message.author.id, 0)
-        if now - last_time < RATE_LIMIT_SECONDS:
-            logger.info(f"User {message.author} is rate limited. Time since last processing: {now - last_time:.2f} seconds.")
+        if not runtime_state.allow_user_action(message.author.id, "twitter", RATE_LIMIT_SECONDS):
+            logger.info(f"User {message.author} is rate limited for Twitter/X processing.")
             return
-        user_rate_limit[message.author.id] = now
 
         # Attempt to delete the original message once
         try:
@@ -1129,12 +1115,9 @@ async def on_message(message):
     # Process TikTok links
     tiktok_matches = list(TIKTOK_URL_REGEX.finditer(message.content))
     if tiktok_matches:
-        now = time.time()
-        last_time = user_rate_limit.get(message.author.id, 0)
-        if now - last_time < RATE_LIMIT_SECONDS:
-            logger.info(f"User {message.author} is rate limited for TikTok link. Time since last processing: {now - last_time:.2f} seconds.")
+        if not runtime_state.allow_user_action(message.author.id, "tiktok", RATE_LIMIT_SECONDS):
+            logger.info(f"User {message.author} is rate limited for TikTok link.")
             return
-        user_rate_limit[message.author.id] = now
         tiktok_urls = [match.group(0) for match in tiktok_matches]
         logger.info(f"Processing TikTok links from {message.author} (ID: {message.id}) with URLs: {tiktok_urls}")
         links_processed += await process_media_links(
@@ -1150,12 +1133,9 @@ async def on_message(message):
     # Process Instagram links
     instagram_matches = list(INSTAGRAM_URL_REGEX.finditer(message.content))
     if instagram_matches:
-        now = time.time()
-        last_time = user_rate_limit.get(message.author.id, 0)
-        if now - last_time < RATE_LIMIT_SECONDS:
-            logger.info(f"User {message.author} is rate limited for Instagram link. Time since last processing: {now - last_time:.2f} seconds.")
+        if not runtime_state.allow_user_action(message.author.id, "instagram", RATE_LIMIT_SECONDS):
+            logger.info(f"User {message.author} is rate limited for Instagram link.")
             return
-        user_rate_limit[message.author.id] = now
         instagram_urls = [match.group(0) for match in instagram_matches]
         logger.info(f"Processing Instagram links from {message.author} (ID: {message.id}) with URLs: {instagram_urls}")
         links_processed += await process_media_links(
