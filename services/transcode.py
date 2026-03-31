@@ -22,7 +22,10 @@ def get_video_duration_seconds(filepath: str, timeout_seconds: int) -> float | N
         )
         value = float(result.stdout.strip())
         return value if value > 0 else None
-    except Exception as exc:
+    except subprocess.TimeoutExpired:
+        logger.warning("ffprobe timed out for %s", filepath)
+        return None
+    except (ValueError, subprocess.CalledProcessError) as exc:
         logger.warning("ffprobe failed for %s: %s", filepath, exc)
         return None
 
@@ -30,7 +33,7 @@ def get_video_duration_seconds(filepath: str, timeout_seconds: int) -> float | N
 def calculate_target_bitrates(max_size_bytes: int, duration_seconds: float, headroom_ratio: float) -> tuple[int, int]:
     target_bits = int(max_size_bytes * 8 * headroom_ratio)
     audio = 96_000
-    total = max(int(target_bits / duration_seconds), audio + 50_000)
+    total = max(int(target_bits / max(duration_seconds, 1.0)), audio + 50_000)
     video = max(total - audio, 300_000)
     return video, audio
 
@@ -47,6 +50,10 @@ def compress_video_to_limit(
     if not shutil.which("ffmpeg"):
         logger.error("ffmpeg not found in PATH")
         return None
+
+    if os.path.getsize(filepath) <= max_size_bytes:
+        return filepath
+
     duration = get_video_duration_seconds(filepath, ffprobe_timeout_seconds)
     if duration is None:
         return None
@@ -71,12 +78,20 @@ def compress_video_to_limit(
         if allow_nvenc:
             try:
                 _run("h264_nvenc", "p4", ["-gpu", "0"])
-            except Exception:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                logger.warning("NVENC compression failed, retrying with libx264: %s", exc)
                 _run("libx264", "veryfast")
         else:
             _run("libx264", "veryfast")
-    except Exception as exc:
+    except subprocess.TimeoutExpired:
+        logger.error("Compression timed out for %s", filepath)
+        return None
+    except subprocess.CalledProcessError as exc:
         logger.error("Compression failed for %s: %s", filepath, exc)
         return None
 
-    return out if os.path.exists(out) else None
+    if not os.path.exists(out):
+        logger.error("Compression output file missing: %s", out)
+        return None
+
+    return out
