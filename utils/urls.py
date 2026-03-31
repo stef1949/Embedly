@@ -9,6 +9,18 @@ TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "vm.tiktok.com"}
 INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com", "instagr.am", "www.instagr.am"}
 
 URL_REGEX = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
+TRAILING_PUNCTUATION = ".,!?;:)]}"
+
+_TIKTOK_PATHS = (
+    re.compile(r"^/@[\w\.]+/video/\d+/?$", re.IGNORECASE),
+    re.compile(r"^/t/[A-Za-z0-9]+/?$"),
+    re.compile(r"^/[A-Za-z0-9]{8,12}/?$"),
+)
+
+_INSTAGRAM_PATHS = (
+    re.compile(r"^/(?:p|reel|reels|tv)/[\w\-]+/?$", re.IGNORECASE),
+    re.compile(r"^/stories/[\w\.]+/\d+/?$", re.IGNORECASE),
+)
 
 
 @dataclass(frozen=True)
@@ -18,11 +30,15 @@ class RewriteResult:
 
 
 def sanitize_url(url: str) -> str:
-    return re.sub(r"[^\w\.\/:\-\?\&\=\%\@#]", "", url)
+    return re.sub(r"[^\w\./:\-\?\&\=\%\@#]", "", url)
 
 
 def _normalize_host(hostname: str | None) -> str:
-    return (hostname or "").lower()
+    return (hostname or "").lower().strip(".")
+
+
+def _strip_trailing_punctuation(url: str) -> str:
+    return url.rstrip(TRAILING_PUNCTUATION)
 
 
 def _is_spoiler(content: str, start: int, end: int) -> bool:
@@ -36,13 +52,14 @@ def rewrite_twitter_urls(content: str) -> RewriteResult:
     rewritten: list[str] = []
     spoiler: list[str] = []
     for match in URL_REGEX.finditer(content):
-        raw_url = match.group(0)
+        raw_url = _strip_trailing_punctuation(match.group(0))
         parsed = urlsplit(raw_url)
         host = _normalize_host(parsed.hostname)
-        if host == "vxtwitter.com" or host == "www.vxtwitter.com":
+        if host in {"vxtwitter.com", "www.vxtwitter.com"}:
             continue
         if host not in TWITTER_HOSTS:
             continue
+
         clean = sanitize_url(raw_url)
         p = urlsplit(clean)
         replaced = urlunsplit((p.scheme, "vxtwitter.com", p.path, p.query, ""))
@@ -54,17 +71,23 @@ def rewrite_twitter_urls(content: str) -> RewriteResult:
 
 
 def validate_tiktok_url(url: str) -> str:
-    clean = sanitize_url(url)
+    clean = _strip_trailing_punctuation(sanitize_url(url))
     parsed = urlsplit(clean)
-    if _normalize_host(parsed.hostname) not in TIKTOK_HOSTS:
+    host = _normalize_host(parsed.hostname)
+    if host not in TIKTOK_HOSTS:
+        return clean
+    if any(pattern.match(parsed.path or "") for pattern in _TIKTOK_PATHS):
         return clean
     return clean
 
 
 def validate_instagram_url(url: str) -> str:
-    clean = sanitize_url(url)
+    clean = _strip_trailing_punctuation(sanitize_url(url))
     parsed = urlsplit(clean)
-    if _normalize_host(parsed.hostname) not in INSTAGRAM_HOSTS:
+    host = _normalize_host(parsed.hostname)
+    if host not in INSTAGRAM_HOSTS:
+        return clean
+    if any(pattern.match(parsed.path or "") for pattern in _INSTAGRAM_PATHS):
         return clean
     return clean
 

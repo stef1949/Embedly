@@ -94,6 +94,21 @@ ffmpeg -encoders | grep nvenc
 python embedbot.py
 ```
 
+
+## Project layout
+
+The codebase is organized into focused modules:
+
+* `embedbot.py` - bot entrypoint and Discord event/command wiring
+* `handlers/twitter.py` - Twitter/X rewrite message send flow
+* `handlers/media.py` - shared TikTok/Instagram processing pipeline
+* `services/downloaders.py` - yt-dlp download abstraction
+* `services/transcode.py` - ffmpeg/ffprobe helpers and compression
+* `utils/urls.py` - URL parsing/validation/rewriting logic
+* `views.py` - persistent Discord UI control views
+* `runtime_state.py` - in-memory rate limiting state
+* `security.py` - authorization helpers for message controls
+
 ## Environment variables
 The bot supports these environment variables (with defaults):
 

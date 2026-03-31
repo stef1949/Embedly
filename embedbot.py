@@ -13,6 +13,8 @@ from config import load_config
 from utils.urls import rewrite_twitter_urls, validate_tiktok_url as validate_tiktok_url_safe, validate_instagram_url as validate_instagram_url_safe
 from services.transcode import compress_video_to_limit as compress_video_to_limit_safe
 from views import MessageControlView, TikTokControlView, InstagramControlView, configure_view_context
+from handlers.media import MediaProcessingConfig, process_media_links as process_media_links_shared
+from handlers.twitter import send_twitter_rewrite_message
 from runtime_state import RuntimeState
 
 # Configure logging to show the time, logger name, level, and message.
@@ -70,6 +72,15 @@ FFPROBE_TIMEOUT_SECONDS = CONFIG.ffprobe_timeout_seconds
 FFMPEG_TIMEOUT_SECONDS = CONFIG.ffmpeg_timeout_seconds
 UPLOAD_LIMIT_BYTES = CONFIG.upload_limit_bytes
 media_semaphore = asyncio.Semaphore(CONFIG.media_concurrency)
+media_config = MediaProcessingConfig(
+    temp_directory=CONFIG.temp_directory,
+    upload_limit_bytes=UPLOAD_LIMIT_BYTES,
+    ytdlp_timeout_seconds=YTDLP_TIMEOUT_SECONDS,
+    ffmpeg_timeout_seconds=FFMPEG_TIMEOUT_SECONDS,
+    ffprobe_timeout_seconds=FFPROBE_TIMEOUT_SECONDS,
+    ffmpeg_headroom_ratio=CONFIG.ffmpeg_headroom_ratio,
+    use_nvidia_gpu=CONFIG.use_nvidia_gpu,
+)
 
 persistent_views_registered = False
 
@@ -997,121 +1008,22 @@ async def on_message(message):
 
     rewrite_result = rewrite_twitter_urls(message.content)
     if rewrite_result.rewritten_urls or rewrite_result.spoiler_urls:
-        spoiler_urls = rewrite_result.spoiler_urls
-        non_spoiler_urls = rewrite_result.rewritten_urls
-        
         if not runtime_state.allow_user_action(message.author.id, "twitter", RATE_LIMIT_SECONDS):
             logger.info(f"User {message.author} is rate limited for Twitter/X processing.")
             return
 
-        # Attempt to delete the original message once
+        await maybe_delete_original_message(message, "twitter")
+
+        should_emulate = user_emulation_preferences.get(message.author.id, DEFAULT_EMULATION)
         try:
-            await message.delete()
-            logger.info(f"Deleted original message {message.id} from {message.author}")
-        except discord.Forbidden:
-            logger.warning(f"Missing permissions to delete message {message.id} from {message.author}")
-        except discord.HTTPException as e:
-            logger.error(f"Failed to delete message {message.id}: {e}")
-
-        if spoiler_urls:
-            logger.info(f"Processing spoilered message from {message.author} (ID: {message.id}) with URLs: {spoiler_urls}")
-
-            spoiler_response = "\n".join(spoiler_urls)
-
-            links_processed += len(spoiler_urls)
-
-            spoiler_view = MessageControlView(timeout=604800)  # 7 days timeout
-            spoiler_view.original_author_id = message.author.id
-
-            placeholder = "||spoiler||"
-            embed = discord.Embed(
-                title="Spoiler Embed",
-                description="This tweet is hidden behind a spoiler. Click to reveal.",
-                color=0x1DA1F2
+            links_processed += await send_twitter_rewrite_message(
+                message=message,
+                rewrite_result=rewrite_result,
+                should_emulate=should_emulate,
             )
-            embed.add_field(name="Link", value=spoiler_response, inline=False)
-            sent_spoiler_message = await message.channel.send(
-                content=placeholder,
-                embed=embed,
-                view=spoiler_view
-            )
-            spoiler_view.message = sent_spoiler_message
+        except Exception as e:
+            logger.error(f"Error sending rewritten Twitter/X message for {message.id}: {e}")
 
-        if non_spoiler_urls:
-            logger.info(f"Processing message from {message.author} (ID: {message.id}) with URLs: {non_spoiler_urls}")
-            response = "\n".join(non_spoiler_urls)
-
-            links_processed += len(non_spoiler_urls)
-
-            view = MessageControlView(timeout=604800)
-            view.original_author_id = message.author.id
-
-            # Check the user's emulation preference and send the message accordingly.
-            should_emulate = user_emulation_preferences.get(message.author.id, DEFAULT_EMULATION)
-
-            if should_emulate:
-                webhook_permissions = False
-                if isinstance(message.channel, discord.TextChannel):
-                    bot_permissions = message.channel.permissions_for(message.guild.me)
-                    webhook_permissions = bot_permissions.manage_webhooks
-
-                if webhook_permissions:
-                    webhook = None
-                    try:
-                        webhook = await message.channel.create_webhook(name="TempWebhook")
-                        logger.info(f"Created temporary webhook in channel {message.channel} for message {message.id}")
-
-                        sent_message = await webhook.send(
-                            content=response,
-                            username=message.author.display_name,
-                            avatar_url=message.author.display_avatar.url,
-                            view=view
-                        )
-                        view.message = sent_message
-                        logger.info(f"Sent modified message via webhook for message {message.id}")
-                    except discord.Forbidden as e:
-                        logger.error(f"Webhook permission error for message {message.id}: {e}")
-                        try:
-                            user_id_mention = f"<@{message.author.id}>"
-                            sent_message = await message.channel.send(f"**Link shared by {user_id_mention}:**\n{response}", view=view)
-                            view.message = sent_message
-                            logger.info(f"Sent modified message via bot fallback for message {message.id}")
-                        except Exception as e2:
-                            logger.error(f"Failed to send fallback message for message {message.id}: {e2}")
-                    except Exception as e:
-                        logger.error(f"Webhook error for message {message.id}: {e}")
-                        try:
-                            user_id_mention = f"<@{message.author.id}>"
-                            sent_message = await message.channel.send(f"**Link shared by {user_id_mention}:**\n{response}", view=view)
-                            view.message = sent_message
-                            logger.info(f"Sent modified message via bot fallback for message {message.id}")
-                        except Exception as e2:
-                            logger.error(f"Failed to send fallback message for message {message.id}: {e2}")
-                    finally:
-                        if webhook:
-                            try:
-                                await webhook.delete()
-                                logger.info(f"Deleted temporary webhook for message {message.id}")
-                            except Exception as e:
-                                logger.warning(f"Failed to delete temporary webhook for message {message.id}: {e}")
-                else:
-                    logger.warning(f"No webhook permissions in channel {message.channel.id}, using fallback method")
-                    try:
-                        user_id_mention = f"<@{message.author.id}>"
-                        sent_message = await message.channel.send(f"**Link shared by {user_id_mention}:**\n{response}", view=view)
-                        view.message = sent_message
-                        logger.info(f"Sent modified message as bot due to missing webhook permissions for message {message.id}")
-                    except Exception as e:
-                        logger.error(f"Failed to send message as bot for message {message.id}: {e}")
-            else:
-                try:
-                    user_id_mention = f"<@{message.author.id}>"
-                    sent_message = await message.channel.send(f"**Link shared by {user_id_mention}:**\n{response}", view=view)
-                    view.message = sent_message
-                    logger.info(f"Sent modified message as bot (per user preference) for message {message.id}")
-                except Exception as e:
-                    logger.error(f"Failed to send message as bot for message {message.id}: {e}")
-    
     # Process TikTok links
     tiktok_matches = list(TIKTOK_URL_REGEX.finditer(message.content))
     if tiktok_matches:
@@ -1120,7 +1032,7 @@ async def on_message(message):
             return
         tiktok_urls = [match.group(0) for match in tiktok_matches]
         logger.info(f"Processing TikTok links from {message.author} (ID: {message.id}) with URLs: {tiktok_urls}")
-        links_processed += await process_media_links(
+        links_processed += await process_media_links_shared(
             message=message,
             urls=tiktok_urls,
             source_name="TikTok",
@@ -1128,6 +1040,9 @@ async def on_message(message):
             url_validator=validate_tiktok_url_safe,
             downloader=download_tiktok_video,
             view_factory=lambda url: TikTokControlView(original_url=url, timeout=604800),
+            compressor=compress_video_to_limit_safe,
+            semaphore=media_semaphore,
+            config=media_config,
         )
 
     # Process Instagram links
@@ -1138,7 +1053,7 @@ async def on_message(message):
             return
         instagram_urls = [match.group(0) for match in instagram_matches]
         logger.info(f"Processing Instagram links from {message.author} (ID: {message.id}) with URLs: {instagram_urls}")
-        links_processed += await process_media_links(
+        links_processed += await process_media_links_shared(
             message=message,
             urls=instagram_urls,
             source_name="Instagram",
@@ -1146,6 +1061,9 @@ async def on_message(message):
             url_validator=validate_instagram_url_safe,
             downloader=download_instagram_video,
             view_factory=lambda url: InstagramControlView(original_url=url, timeout=604800),
+            compressor=compress_video_to_limit_safe,
+            semaphore=media_semaphore,
+            config=media_config,
         )
 
 # Run the bot

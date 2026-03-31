@@ -1,11 +1,5 @@
-from services.downloaders import download_video
+from services.downloaders import DownloadResult, download_video
 
 
-def download_instagram_video(video_url, output_folder=None):
-    result = download_video(video_url, output_folder=output_folder)
-    return {
-        "success": result.success,
-        "filepath": result.filepath,
-        "title": result.title,
-        "error": result.error,
-    }
+def download_instagram_video(video_url: str, output_folder: str | None = None) -> DownloadResult:
+    return download_video(video_url, output_folder=output_folder)
