@@ -6,9 +6,14 @@ import time
 import sys
 import asyncio
 import subprocess
-from discord.ext import commands
+from typing import Callable
 from tiktok_handler import download_tiktok_video
 from instagram_handler import download_instagram_video
+from config import load_config
+from utils.urls import rewrite_twitter_urls, validate_tiktok_url as validate_tiktok_url_safe, validate_instagram_url as validate_instagram_url_safe
+from services.transcode import compress_video_to_limit as compress_video_to_limit_safe
+from views import MessageControlView, TikTokControlView, InstagramControlView, configure_view_context
+from runtime_state import RuntimeState
 
 # Configure logging to show the time, logger name, level, and message.
 logging.basicConfig(
@@ -21,10 +26,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Retrieve the token from an environment variable
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("No Discord token provided. Please set the DISCORD_BOT_TOKEN environment variable.")
+CONFIG = load_config()
+TOKEN = CONFIG.discord_token
 
 # Enable the message content intent (required to read messages)
 intents = discord.Intents.default()
@@ -33,9 +36,6 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
 
-# Regex to match URLs that start with http(s):// and include twitter.com or x.com
-URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:twitter\.com|x\.com)/\S+)', re.IGNORECASE)
-
 # Regex to match TikTok URLs
 TIKTOK_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com)/\S+)', re.IGNORECASE)
 
@@ -43,12 +43,12 @@ TIKTOK_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.c
 INSTAGRAM_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reels?|tv|stories)/\S+)', re.IGNORECASE)
 
 # Rate limiting configuration (per user)
-RATE_LIMIT_SECONDS = 10
-user_rate_limit = {}  # Dictionary mapping user ID to last processed timestamp
+RATE_LIMIT_SECONDS = CONFIG.rate_limit_seconds
+runtime_state = RuntimeState()
 
 # User preferences for emulation (True = emulate user, False = post as bot)
 user_emulation_preferences = {}  # Maps user ID to boolean preference
-DEFAULT_EMULATION = True  # Default to emulating users
+DEFAULT_EMULATION = CONFIG.default_emulation  # Default to emulating users
 
 # Bot statistics
 bot_start_time = time.time()
@@ -56,8 +56,7 @@ links_processed = 0
 version = "1.2.2"  # Bot version
 
 # Security settings
-GLOBAL_RATE_LIMIT = 30  # Maximum requests per minute across all users
-global_request_timestamps = []  # List of timestamps for global rate limiting
+GLOBAL_RATE_LIMIT = CONFIG.global_rate_limit_per_minute  # Maximum requests per minute across all users
 BANNED_USERS = set()  # Set of banned user IDs
 SERVER_BLACKLIST = set()  # Set of blacklisted server IDs
 ADMIN_IDS = set()  # Set of bot admin user IDs
@@ -66,25 +65,18 @@ ADMIN_IDS = set()  # Set of bot admin user IDs
 server_settings = {}  # Maps server ID to settings dict
 
 # Timeouts for blocking operations (seconds)
-YTDLP_TIMEOUT_SECONDS = int(os.getenv("YTDLP_TIMEOUT_SECONDS", "120"))
-FFPROBE_TIMEOUT_SECONDS = int(os.getenv("FFPROBE_TIMEOUT_SECONDS", "15"))
-FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "120"))
+YTDLP_TIMEOUT_SECONDS = CONFIG.ytdlp_timeout_seconds
+FFPROBE_TIMEOUT_SECONDS = CONFIG.ffprobe_timeout_seconds
+FFMPEG_TIMEOUT_SECONDS = CONFIG.ffmpeg_timeout_seconds
+UPLOAD_LIMIT_BYTES = CONFIG.upload_limit_bytes
+media_semaphore = asyncio.Semaphore(CONFIG.media_concurrency)
 
 persistent_views_registered = False
 
 # Utility functions for security
 def check_global_rate_limit():
     """Check if the global rate limit has been exceeded"""
-    now = time.time()
-    # Remove timestamps older than 60 seconds
-    global global_request_timestamps
-    global_request_timestamps = [ts for ts in global_request_timestamps if now - ts < 60]
-    # Check if we've exceeded the global rate limit
-    if len(global_request_timestamps) >= GLOBAL_RATE_LIMIT:
-        return False
-    # Add current timestamp and return True (not rate limited)
-    global_request_timestamps.append(now)
-    return True
+    return runtime_state.allow_global_request(GLOBAL_RATE_LIMIT)
 
 def is_user_banned(user_id):
     """Check if a user is banned from using the bot"""
@@ -231,10 +223,10 @@ def cleanup_file(filepath):
     except OSError as e:
         logger.warning(f"Failed to clean up file {filepath}: {e}")
 
-async def run_blocking(func, *args, timeout_seconds=None):
+async def run_blocking(func, *args, timeout_seconds=None, **kwargs):
     if timeout_seconds:
-        return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout_seconds)
-    return await asyncio.to_thread(func, *args)
+        return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=timeout_seconds)
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 def get_video_duration_seconds(filepath):
     """Return video duration in seconds using ffprobe, or None on failure"""
@@ -347,6 +339,95 @@ async def delete_message_silently(message):
         logger.debug(f"Could not delete message {message.id}: {e}")
     except Exception as e:
         logger.warning(f"Unexpected error deleting message {message.id}: {e}")
+
+
+async def maybe_delete_original_message(message: discord.Message, context: str) -> None:
+    """Delete a source message with consistent error handling."""
+    try:
+        await message.delete()
+        logger.info(f"Deleted original {context} message {message.id} from {message.author}")
+    except discord.Forbidden:
+        logger.warning(f"Missing permissions to delete {context} message {message.id} from {message.author}")
+    except discord.HTTPException as e:
+        logger.error(f"Failed to delete {context} message {message.id}: {e}")
+
+
+async def process_media_links(
+    *,
+    message: discord.Message,
+    urls: list[str],
+    source_name: str,
+    icon: str,
+    url_validator: Callable[[str], str],
+    downloader: Callable,
+    view_factory: Callable[[str], discord.ui.View],
+) -> int:
+    """Shared media processing flow for TikTok/Instagram links."""
+    processed = 0
+    for source_url in urls:
+        validated_url = url_validator(source_url)
+        processing_msg = await message.channel.send(f"⏳ Downloading {source_name} video from <@{message.author.id}>...")
+        result = None
+        filepath = None
+        original_filepath = None
+        try:
+            async with media_semaphore:
+                result = await run_blocking(
+                    downloader,
+                    validated_url,
+                    output_folder=CONFIG.temp_directory,
+                    timeout_seconds=YTDLP_TIMEOUT_SECONDS,
+                )
+            if not result or not result.get("success"):
+                logger.error("%s download failed: %s", source_name, result.get("error", "Unknown error") if result else "Unknown error")
+                continue
+
+            original_filepath = result["filepath"]
+            filepath = original_filepath
+            file_size = os.path.getsize(filepath)
+            if file_size > UPLOAD_LIMIT_BYTES:
+                compressed_path = await run_blocking(
+                    compress_video_to_limit_safe,
+                    filepath,
+                    UPLOAD_LIMIT_BYTES,
+                    ffprobe_timeout_seconds=FFPROBE_TIMEOUT_SECONDS,
+                    ffmpeg_timeout_seconds=FFMPEG_TIMEOUT_SECONDS,
+                    headroom_ratio=CONFIG.ffmpeg_headroom_ratio,
+                    use_nvidia_gpu=CONFIG.use_nvidia_gpu,
+                    timeout_seconds=FFMPEG_TIMEOUT_SECONDS,
+                )
+                if not compressed_path:
+                    logger.warning("%s compression failed for %s", source_name, filepath)
+                    continue
+                filepath = compressed_path
+                if os.path.getsize(filepath) > UPLOAD_LIMIT_BYTES:
+                    logger.warning("Compressed %s video still exceeds upload limit: %s", source_name, filepath)
+                    continue
+
+            media_view = view_factory(validated_url)
+            media_view.original_author_id = message.author.id
+            with open(filepath, "rb") as media_file:
+                file = discord.File(media_file, filename=os.path.basename(filepath))
+                await delete_message_silently(processing_msg)
+                sent_message = await message.channel.send(
+                    content=f"{icon} **{source_name} video shared by <@{message.author.id}>:**\n{result.get('title', 'Unknown Title')}",
+                    file=file,
+                    view=media_view,
+                )
+                media_view.message = sent_message
+            processed += 1
+            await maybe_delete_original_message(message, source_name)
+        except asyncio.TimeoutError:
+            logger.error("%s operation timed out for URL: %s", source_name, validated_url)
+        except (discord.HTTPException, discord.Forbidden, OSError, IOError) as e:
+            logger.error("Error processing %s video %s: %s", source_name, validated_url, e)
+        finally:
+            await delete_message_silently(processing_msg)
+            if filepath:
+                cleanup_file(filepath)
+            if original_filepath and original_filepath != filepath:
+                cleanup_file(original_filepath)
+    return processed
 
 # Security event logging
 def log_security_event(event_type, user_id, guild_id=None, details=None):
@@ -745,399 +826,6 @@ async def channel_whitelist(interaction: discord.Interaction, channel: discord.T
     log_security_event("CHANNEL_WHITELIST_CHANGED", interaction.user.id, interaction.guild.id,
                      f"Channel {channel.id} {'added to' if add_to_whitelist else 'removed from'} whitelist by {interaction.user.id}")
 
-# Create a view with buttons for message management
-class MessageControlView(discord.ui.View):
-    def __init__(self, timeout: float = 604800):  # 7 days
-        super().__init__(timeout=timeout)
-        self.message = None  # Will store reference to the message
-        self.original_author_id = None  # Will store the original author's ID
-        
-    async def on_timeout(self):
-        """Handle the view timeout by modifying the message if possible"""
-        try:
-            # Try to disable the buttons when they time out
-            for item in self.children:
-                item.disabled = True
-                
-            # Update the message with disabled buttons if it still exists
-            if hasattr(self, "message") and self.message:
-                await self.message.edit(view=self)
-        except Exception as e:
-            logger.error(f"Error handling view timeout: {e}")
-            # Fail silently if the message was deleted or there's another issue
-
-    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, custom_id="delete_button")
-    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Delete button that works even after bot restart by checking the original message"""
-        logger.info(f"Delete button clicked by {interaction.user} in message {interaction.message.id}")
-        
-        # Get the message to find who shared the link
-        try:
-            message = interaction.message
-            
-            # First check if we have the original author ID stored in the view
-            author_id = None
-            if hasattr(self, 'original_author_id') and self.original_author_id:
-                author_id = self.original_author_id
-                logger.info(f"Using stored original author ID: {author_id}")
-            
-            # If not, try to extract from message content
-            if not author_id:
-                # Log message content for debugging
-                logger.info(f"Message content for delete: {message.content}")
-                
-                # Try to find an @mention in the message content with more flexible patterns
-                if message.content:
-                    # Try different regex patterns to extract user ID
-                    mention_patterns = [
-                        r'<@!?(\d+)>',  # Standard mention format <@123456789> or <@!123456789>
-                        r'by <@!?(\d+)>',  # Matches "by @user"
-                        r'by <@!?(\d+)',  # Without closing bracket
-                        r'<@!?(\d+)',  # Just the opening of mention
-                        r'(\d{17,20})',  # Any 17-20 digit number (likely a user ID)
-                    ]
-                    
-                    for pattern in mention_patterns:
-                        mention_match = re.search(pattern, message.content)
-                        if mention_match:
-                            author_id = int(mention_match.group(1))
-                            logger.info(f"Found author ID {author_id} using pattern {pattern}")
-                            break
-            
-            # For messages sent via webhook (user emulation enabled)
-            if not author_id and hasattr(message, 'webhook_id') and message.webhook_id:
-                # In this case, we can't reliably determine the original author from the message alone
-                # Use a fallback check to see if the requesting user is the message author
-                logger.info(f"Webhook message detected for delete: {message.webhook_id}")
-                if interaction.user.id == message.author.id:
-                    author_id = interaction.user.id
-                    logger.info(f"Using interaction user ID as author for delete: {author_id}")
-            
-            # Always allow server admins to delete
-            is_admin_in_server = False
-            if interaction.guild and interaction.guild.get_member(interaction.user.id):
-                member = interaction.guild.get_member(interaction.user.id)
-                is_admin_in_server = member.guild_permissions.administrator
-                if is_admin_in_server:
-                    logger.info(f"User {interaction.user.id} is a server admin, allowing deletion")
-            
-            # Allow deletion by bot admins too
-            is_bot_admin = is_admin(interaction.user.id)
-            if is_bot_admin:
-                logger.info(f"User {interaction.user.id} is a bot admin, allowing deletion")
-            
-            # Always allow server owners to delete
-            is_server_owner = False
-            if interaction.guild and interaction.guild.owner_id == interaction.user.id:
-                is_server_owner = True
-                logger.info(f"User {interaction.user.id} is server owner, allowing deletion")
-        
-            # Only allow the original poster or admins to delete the message
-            logger.info(f"Delete check - Author: {author_id}, User: {interaction.user.id}, Admin: {is_admin_in_server}, Owner: {is_server_owner}")
-            if (author_id and interaction.user.id == author_id) or is_admin_in_server or is_bot_admin or is_server_owner:
-                await message.delete()
-                logger.info(f"Message {message.id} deleted by {interaction.user}")
-                await interaction.response.send_message("Message deleted.", ephemeral=True)
-            else:
-                logger.warning(f"Unauthorized delete attempt by {interaction.user}")
-                await interaction.response.send_message("You are not allowed to delete this message.", ephemeral=True)
-                
-        except discord.NotFound:
-            logger.error(f"Message {interaction.message.id} not found when trying to delete")
-            await interaction.response.send_message("Message already deleted.", ephemeral=True)
-        except Exception as e:
-            logger.error(f"Error in delete button: {e}")
-            await interaction.response.send_message("Error processing request.", ephemeral=True)
-    
-    @discord.ui.button(label="Toggle Emulation", style=discord.ButtonStyle.secondary, custom_id="toggle_emulation")
-    async def toggle_emulation_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Toggle emulation button that works after restart by extracting user ID from message"""
-        logger.info(f"Toggle emulation button clicked by {interaction.user}")
-        
-        # Extract author ID from the message content if possible
-        author_id = None
-        message = interaction.message
-        
-        # First check if we have the original author ID stored in the view
-        if hasattr(self, 'original_author_id') and self.original_author_id:
-            author_id = self.original_author_id
-            logger.info(f"Using stored original author ID for toggle: {author_id}")
-        
-        # Log message content for debugging
-        logger.info(f"Message content for toggle: {message.content}")
-        
-        # If not, try to find an @mention in the message content with more flexible patterns
-        if not author_id and message.content:
-            # Try different regex patterns to extract user ID
-            mention_patterns = [
-                r'<@!?(\d+)>',  # Standard mention format <@123456789> or <@!123456789>
-                r'by <@!?(\d+)>',  # Matches "by @user"
-                r'by <@!?(\d+)',  # Without closing bracket
-                r'<@!?(\d+)',  # Just the opening of mention
-                r'(\d{17,20})',  # Any 17-20 digit number (likely a user ID)
-            ]
-            
-            for pattern in mention_patterns:
-                mention_match = re.search(pattern, message.content)
-                if mention_match:
-                    author_id = int(mention_match.group(1))
-                    logger.info(f"Found author ID {author_id} using pattern {pattern}")
-                    break
-        
-        # For messages sent via webhook (user emulation enabled)
-        if not author_id and hasattr(message, 'webhook_id') and message.webhook_id:
-            logger.info(f"Webhook message detected for toggle: {message.webhook_id}")
-            # For webhook messages, always allow the interaction user to modify settings
-            # This is a reasonable assumption since mostly only the original poster would try to toggle
-            author_id = interaction.user.id
-            logger.info(f"Using interaction user ID as author for toggle: {author_id}")
-        
-        # Always allow server owners to toggle
-        is_server_owner = False
-        if interaction.guild and interaction.guild.owner_id == interaction.user.id:
-            is_server_owner = True
-            logger.info(f"User {interaction.user.id} is server owner, allowing toggle")
-        
-        # Check if user is a bot admin
-        is_bot_admin = is_admin(interaction.user.id)
-        if is_bot_admin:
-            logger.info(f"User {interaction.user.id} is bot admin, allowing toggle")
-        
-        # Only allow the original poster, server owner, or bot admin to change preference
-        logger.info(f"Toggle check - Author: {author_id}, User: {interaction.user.id}, Admin: {is_bot_admin}, Owner: {is_server_owner}")
-        if (author_id and interaction.user.id == author_id) or is_server_owner or is_bot_admin:
-            # Toggle the user's emulation preference
-            user_id_to_toggle = author_id if author_id else interaction.user.id
-            current_preference = user_emulation_preferences.get(user_id_to_toggle, DEFAULT_EMULATION)
-            new_preference = not current_preference
-            user_emulation_preferences[user_id_to_toggle] = new_preference
-            
-            # Notify the user of the change
-            if new_preference:
-                msg = "Future posts will use your name and avatar."
-            else:
-                msg = "Future posts will show as coming from the bot with a mention to you."
-            
-            if author_id and interaction.user.id != author_id:
-                # If admin is changing someone else's preference
-                try:
-                    user = await client.fetch_user(author_id)
-                    username = user.name
-                except:
-                    username = f"User {author_id}"
-                msg = f"Changed {username}'s emulation preference. {msg}"
-            
-            await interaction.response.send_message(msg, ephemeral=True)
-            logger.info(f"User {user_id_to_toggle} emulation preference set to {new_preference} by {interaction.user.id}")
-        else:
-            logger.warning(f"Unauthorized emulation toggle attempt by {interaction.user}")
-            await interaction.response.send_message("You can only change your own emulation preference.", ephemeral=True)
-
-# Create a view with buttons for TikTok message management
-class TikTokControlView(discord.ui.View):
-    def __init__(self, original_url: str, timeout: float = 604800):  # 7 days
-        super().__init__(timeout=timeout)
-        self.message = None  # Will store reference to the message
-        self.original_author_id = None  # Will store the original author's ID
-        self.original_url = original_url  # Store the original TikTok URL
-        
-        # Add the link button with the dynamic URL
-        self.add_item(discord.ui.Button(label="Open Link", style=discord.ButtonStyle.link, url=original_url))
-        
-    async def on_timeout(self):
-        """Handle the view timeout by modifying the message if possible"""
-        try:
-            # Try to disable the buttons when they time out
-            for item in self.children:
-                item.disabled = True
-                
-            # Update the message with disabled buttons if it still exists
-            if hasattr(self, "message") and self.message:
-                await self.message.edit(view=self)
-        except Exception as e:
-            logger.error(f"Error handling TikTok view timeout: {e}")
-            # Fail silently if the message was deleted or there's another issue
-
-    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, custom_id="tiktok_delete_button")
-    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Delete button for TikTok posts"""
-        logger.info(f"TikTok delete button clicked by {interaction.user} in message {interaction.message.id}")
-        
-        # Get the message to find who shared the link
-        try:
-            message = interaction.message
-            
-            # First check if we have the original author ID stored in the view
-            author_id = None
-            if hasattr(self, 'original_author_id') and self.original_author_id:
-                author_id = self.original_author_id
-                logger.info(f"Using stored original author ID: {author_id}")
-            
-            # If not, try to extract from message content
-            if not author_id:
-                # Log message content for debugging
-                logger.info(f"TikTok message content for delete: {message.content}")
-                
-                # Try to find an @mention in the message content
-                if message.content:
-                    # Try different regex patterns to extract user ID
-                    mention_patterns = [
-                        r'<@!?(\d+)>',  # Standard mention format <@123456789> or <@!123456789>
-                        r'shared by <@!?(\d+)>',  # Matches "shared by @user"
-                        r'by <@!?(\d+)>',  # Matches "by @user"
-                        r'by <@!?(\d+)',  # Without closing bracket
-                        r'<@!?(\d+)',  # Just the opening of mention
-                        r'(\d{17,20})',  # Any 17-20 digit number (likely a user ID)
-                    ]
-                    
-                    for pattern in mention_patterns:
-                        mention_match = re.search(pattern, message.content)
-                        if mention_match:
-                            author_id = int(mention_match.group(1))
-                            logger.info(f"Found author ID {author_id} using pattern {pattern}")
-                            break
-            
-            # Always allow server admins to delete
-            is_admin_in_server = False
-            if interaction.guild:
-                member = interaction.guild.get_member(interaction.user.id)
-                if member:
-                    is_admin_in_server = member.guild_permissions.administrator
-                    if is_admin_in_server:
-                        logger.info(f"User {interaction.user.id} is a server admin, allowing deletion")
-            
-            # Allow deletion by bot admins too
-            is_bot_admin = is_admin(interaction.user.id)
-            if is_bot_admin:
-                logger.info(f"User {interaction.user.id} is a bot admin, allowing deletion")
-            
-            # Always allow server owners to delete
-            is_server_owner = False
-            if interaction.guild and interaction.guild.owner_id == interaction.user.id:
-                is_server_owner = True
-                logger.info(f"User {interaction.user.id} is server owner, allowing deletion")
-        
-            # Only allow the original poster or admins to delete the message
-            logger.info(f"TikTok delete check - Author: {author_id}, User: {interaction.user.id}, Admin: {is_admin_in_server}, Owner: {is_server_owner}")
-            if (author_id and interaction.user.id == author_id) or is_admin_in_server or is_bot_admin or is_server_owner:
-                await message.delete()
-                logger.info(f"TikTok message {message.id} deleted by {interaction.user}")
-                await interaction.response.send_message("Message deleted.", ephemeral=True)
-            else:
-                logger.warning(f"Unauthorized TikTok delete attempt by {interaction.user}")
-                await interaction.response.send_message("You are not allowed to delete this message.", ephemeral=True)
-                
-        except discord.NotFound:
-            logger.error(f"TikTok message {interaction.message.id} not found when trying to delete")
-            await interaction.response.send_message("Message already deleted.", ephemeral=True)
-        except Exception as e:
-            logger.error(f"Error in TikTok delete button: {e}")
-            await interaction.response.send_message("Error processing request.", ephemeral=True)
-    
-
-# Create a view with buttons for Instagram message management
-class InstagramControlView(discord.ui.View):
-    def __init__(self, original_url: str, timeout: float = 604800):  # 7 days
-        super().__init__(timeout=timeout)
-        self.message = None  # Will store reference to the message
-        self.original_author_id = None  # Will store the original author's ID
-        self.original_url = original_url  # Store the original Instagram URL
-        
-        # Add the link button with the dynamic URL
-        self.add_item(discord.ui.Button(label="Open Link", style=discord.ButtonStyle.link, url=original_url))
-        
-    async def on_timeout(self):
-        """Handle the view timeout by modifying the message if possible"""
-        try:
-            # Try to disable the buttons when they time out
-            for item in self.children:
-                item.disabled = True
-                
-            # Update the message with disabled buttons if it still exists
-            if hasattr(self, "message") and self.message:
-                await self.message.edit(view=self)
-        except Exception as e:
-            logger.error(f"Error handling Instagram view timeout: {e}")
-            # Fail silently if the message was deleted or there's another issue
-
-    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, custom_id="instagram_delete_button")
-    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Delete button for Instagram posts"""
-        logger.info(f"Instagram delete button clicked by {interaction.user} in message {interaction.message.id}")
-        
-        # Get the message to find who shared the link
-        try:
-            message = interaction.message
-            
-            # First check if we have the original author ID stored in the view
-            author_id = None
-            if hasattr(self, 'original_author_id') and self.original_author_id:
-                author_id = self.original_author_id
-                logger.info(f"Using stored original author ID: {author_id}")
-            
-            # If not, try to extract from message content
-            if not author_id:
-                # Log message content for debugging
-                logger.info(f"Instagram message content for delete: {message.content}")
-                
-                # Try to find an @mention in the message content
-                if message.content:
-                    # Try different regex patterns to extract user ID
-                    mention_patterns = [
-                        r'<@!?(\d+)>',  # Standard mention format <@123456789> or <@!123456789>
-                        r'shared by <@!?(\d+)>',  # Matches "shared by @user"
-                        r'by <@!?(\d+)>',  # Matches "by @user"
-                        r'by <@!?(\d+)',  # Without closing bracket
-                        r'<@!?(\d+)',  # Just the opening of mention
-                        r'(\d{17,20})',  # Any 17-20 digit number (likely a user ID)
-                    ]
-                    
-                    for pattern in mention_patterns:
-                        mention_match = re.search(pattern, message.content)
-                        if mention_match:
-                            author_id = int(mention_match.group(1))
-                            logger.info(f"Found author ID {author_id} using pattern {pattern}")
-                            break
-            
-            # Always allow server admins to delete
-            is_admin_in_server = False
-            if interaction.guild:
-                member = interaction.guild.get_member(interaction.user.id)
-                if member:
-                    is_admin_in_server = member.guild_permissions.administrator
-                    if is_admin_in_server:
-                        logger.info(f"User {interaction.user.id} is a server admin, allowing deletion")
-            
-            # Allow deletion by bot admins too
-            is_bot_admin = is_admin(interaction.user.id)
-            if is_bot_admin:
-                logger.info(f"User {interaction.user.id} is a bot admin, allowing deletion")
-            
-            # Always allow server owners to delete
-            is_server_owner = False
-            if interaction.guild and interaction.guild.owner_id == interaction.user.id:
-                is_server_owner = True
-                logger.info(f"User {interaction.user.id} is server owner, allowing deletion")
-        
-            # Only allow the original poster or admins to delete the message
-            logger.info(f"Instagram delete check - Author: {author_id}, User: {interaction.user.id}, Admin: {is_admin_in_server}, Owner: {is_server_owner}")
-            if (author_id and interaction.user.id == author_id) or is_admin_in_server or is_bot_admin or is_server_owner:
-                await message.delete()
-                logger.info(f"Instagram message {message.id} deleted by {interaction.user}")
-                await interaction.response.send_message("Message deleted.", ephemeral=True)
-            else:
-                logger.warning(f"Unauthorized Instagram delete attempt by {interaction.user}")
-                await interaction.response.send_message("You are not allowed to delete this message.", ephemeral=True)
-                
-        except discord.NotFound:
-            logger.error(f"Instagram message {interaction.message.id} not found when trying to delete")
-            await interaction.response.send_message("Message already deleted.", ephemeral=True)
-        except Exception as e:
-            logger.error(f"Error in Instagram delete button: {e}")
-            await interaction.response.send_message("Error processing request.", ephemeral=True)
-    
-
-
 def register_persistent_views():
     global persistent_views_registered
     if persistent_views_registered:
@@ -1197,9 +885,7 @@ async def security_maintenance():
             
             # Prune old rate limit data
             now = time.time()
-            for user_id in list(user_rate_limit.keys()):
-                if now - user_rate_limit[user_id] > 3600:  # Remove entries older than 1 hour
-                    del user_rate_limit[user_id]
+            runtime_state.prune_user_entries(older_than_seconds=3600, now=now)
             
             # Wait for 1 hour before the next run
             await asyncio.sleep(3600)
@@ -1210,6 +896,12 @@ async def security_maintenance():
 @client.event
 async def on_ready():
     logger.info(f"Logged in as {client.user}!")
+    configure_view_context(
+        is_admin=is_admin,
+        user_emulation_preferences=user_emulation_preferences,
+        default_emulation=DEFAULT_EMULATION,
+        fetch_user=client.fetch_user,
+    )
     register_persistent_views()
     cuda_visible = os.getenv("CUDA_VISIBLE_DEVICES")
     nvidia_visible = os.getenv("NVIDIA_VISIBLE_DEVICES")
@@ -1303,29 +995,14 @@ async def on_message(message):
         logger.warning("Global rate limit exceeded, ignoring message")
         return
 
-    # Process only messages that contain twitter.com or x.com links using re.finditer
-    matches = list(URL_REGEX.finditer(message.content))
-    if matches:
-        spoiler_urls = []
-        non_spoiler_urls = []
-        for match in matches:
-            url = match.group(0)
-            start_index = match.start()
-            end_index = match.end()
-            # Check if the URL is wrapped in spoiler tags '||'
-            if start_index >= 2 and end_index + 2 <= len(message.content) and \
-               message.content[start_index-2:start_index] == "||" and \
-               message.content[end_index:end_index+2] == "||":
-                spoiler_urls.append(url)
-            else:
-                non_spoiler_urls.append(url)
+    rewrite_result = rewrite_twitter_urls(message.content)
+    if rewrite_result.rewritten_urls or rewrite_result.spoiler_urls:
+        spoiler_urls = rewrite_result.spoiler_urls
+        non_spoiler_urls = rewrite_result.rewritten_urls
         
-        now = time.time()
-        last_time = user_rate_limit.get(message.author.id, 0)
-        if now - last_time < RATE_LIMIT_SECONDS:
-            logger.info(f"User {message.author} is rate limited. Time since last processing: {now - last_time:.2f} seconds.")
+        if not runtime_state.allow_user_action(message.author.id, "twitter", RATE_LIMIT_SECONDS):
+            logger.info(f"User {message.author} is rate limited for Twitter/X processing.")
             return
-        user_rate_limit[message.author.id] = now
 
         # Attempt to delete the original message once
         try:
@@ -1339,10 +1016,7 @@ async def on_message(message):
         if spoiler_urls:
             logger.info(f"Processing spoilered message from {message.author} (ID: {message.id}) with URLs: {spoiler_urls}")
 
-            # Sanitize and convert URLs
-            spoiler_urls = [sanitize_url(url) for url in spoiler_urls]
-            modified_spoiler_urls = [re.sub(r'(twitter\.com|x\.com)', 'vxtwitter.com', url, flags=re.IGNORECASE) for url in spoiler_urls]
-            spoiler_response = "\n".join(modified_spoiler_urls)
+            spoiler_response = "\n".join(spoiler_urls)
 
             links_processed += len(spoiler_urls)
 
@@ -1365,9 +1039,7 @@ async def on_message(message):
 
         if non_spoiler_urls:
             logger.info(f"Processing message from {message.author} (ID: {message.id}) with URLs: {non_spoiler_urls}")
-            non_spoiler_urls = [sanitize_url(url) for url in non_spoiler_urls]
-            modified_urls = [re.sub(r'(twitter\.com|x\.com)', 'vxtwitter.com', url, flags=re.IGNORECASE) for url in non_spoiler_urls]
-            response = "\n".join(modified_urls)
+            response = "\n".join(non_spoiler_urls)
 
             links_processed += len(non_spoiler_urls)
 
@@ -1443,242 +1115,38 @@ async def on_message(message):
     # Process TikTok links
     tiktok_matches = list(TIKTOK_URL_REGEX.finditer(message.content))
     if tiktok_matches:
-        # Check rate limit
-        now = time.time()
-        last_time = user_rate_limit.get(message.author.id, 0)
-        if now - last_time < RATE_LIMIT_SECONDS:
-            logger.info(f"User {message.author} is rate limited for TikTok link. Time since last processing: {now - last_time:.2f} seconds.")
+        if not runtime_state.allow_user_action(message.author.id, "tiktok", RATE_LIMIT_SECONDS):
+            logger.info(f"User {message.author} is rate limited for TikTok link.")
             return
-        user_rate_limit[message.author.id] = now
-        
-        # Extract TikTok URLs
         tiktok_urls = [match.group(0) for match in tiktok_matches]
         logger.info(f"Processing TikTok links from {message.author} (ID: {message.id}) with URLs: {tiktok_urls}")
-        
-        # Process each TikTok link
-        for tiktok_url in tiktok_urls:
-            # Validate and sanitize the URL
-            validated_url = validate_tiktok_url(tiktok_url)
-            
-            # Send a processing message
-            processing_msg = await message.channel.send(f"⏳ Downloading TikTok video from <@{message.author.id}>...")
-            
-            # Download the video
-            try:
-                result = await run_blocking(
-                    download_tiktok_video,
-                    validated_url,
-                    timeout_seconds=YTDLP_TIMEOUT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"TikTok download timed out for URL: {validated_url}")
-                await delete_message_silently(processing_msg)
-                continue
-            
-            if result['success']:
-                try:
-                    # Check file size (Discord has a file size limit)
-                    original_filepath = result['filepath']
-                    filepath = original_filepath
-                    file_size = os.path.getsize(filepath)
-                    
-                    # Discord's file size limit is 8MB for non-nitro, 50MB for nitro level 1, 100MB for nitro level 2
-                    # We'll use 8MB as a safe limit
-                    max_size = 8 * 1024 * 1024  # 8MB in bytes
-                    
-                    if file_size > max_size:
-                        logger.warning(f"TikTok video too large ({file_size} bytes). Attempting compression.")
-                        compressed_path = None
-                        try:
-                            compressed_path = await run_blocking(
-                                compress_video_to_limit,
-                                filepath,
-                                max_size,
-                                timeout_seconds=FFMPEG_TIMEOUT_SECONDS
-                            )
-                        except asyncio.TimeoutError:
-                            logger.error(f"FFmpeg compression timed out for {filepath}")
-                        if not compressed_path:
-                            # Clean up the file
-                            cleanup_file(filepath)
-                            # Delete the processing message silently
-                            await delete_message_silently(processing_msg)
-                            continue
-                        filepath = compressed_path
-                        file_size = os.path.getsize(filepath)
-                        if file_size > max_size:
-                            logger.warning(f"Compressed TikTok video still too large: {file_size} bytes")
-                            cleanup_file(filepath)
-                            if filepath != original_filepath:
-                                cleanup_file(original_filepath)
-                            await delete_message_silently(processing_msg)
-                            continue
-                        if filepath != original_filepath:
-                            cleanup_file(original_filepath)
-                    # Create a view with buttons for TikTok controls
-                    tiktok_view = TikTokControlView(original_url=validated_url, timeout=604800)  # 7 days timeout
-                    tiktok_view.original_author_id = message.author.id
-                    
-                    # Upload the video
-                    with open(filepath, 'rb') as f:
-                        file = discord.File(f, filename=os.path.basename(filepath))
-                        # Delete processing message and send new message with file
-                        await processing_msg.delete()
-                        sent_message = await message.channel.send(
-                            content=f"🎵 **TikTok video shared by <@{message.author.id}>:**\n{result['title']}",
-                            file=file,
-                            view=tiktok_view
-                        )
-                        tiktok_view.message = sent_message
-                        logger.info(f"Successfully uploaded TikTok video: {result['title']}")
-                    
-                    # Clean up the file
-                    cleanup_file(filepath)
-                    
-                    # Increment the links processed counter
-                    links_processed += 1
-                    
-                    # Try to delete the original message
-                    try:
-                        await message.delete()
-                        logger.info(f"Deleted original TikTok message {message.id} from {message.author}")
-                    except discord.Forbidden:
-                        logger.warning(f"Missing permissions to delete TikTok message {message.id} from {message.author}")
-                    except discord.HTTPException as e:
-                        logger.error(f"Failed to delete TikTok message {message.id}: {e}")
-                
-                except (discord.HTTPException, discord.Forbidden, OSError, IOError) as e:
-                    logger.error(f"Error uploading TikTok video: {e}")
-                    # Clean up the file if it exists
-                    cleanup_file(result['filepath'])
-                    if 'filepath' in locals() and filepath != result['filepath']:
-                        cleanup_file(filepath)
-                    # Delete the processing message silently
-                    await delete_message_silently(processing_msg)
-            else:
-                logger.error(f"TikTok download failed: {result.get('error', 'Unknown error')}")
-                # Delete the processing message silently
-                await delete_message_silently(processing_msg)
-    
+        links_processed += await process_media_links(
+            message=message,
+            urls=tiktok_urls,
+            source_name="TikTok",
+            icon="🎵",
+            url_validator=validate_tiktok_url_safe,
+            downloader=download_tiktok_video,
+            view_factory=lambda url: TikTokControlView(original_url=url, timeout=604800),
+        )
+
     # Process Instagram links
     instagram_matches = list(INSTAGRAM_URL_REGEX.finditer(message.content))
     if instagram_matches:
-        # Check rate limit
-        now = time.time()
-        last_time = user_rate_limit.get(message.author.id, 0)
-        if now - last_time < RATE_LIMIT_SECONDS:
-            logger.info(f"User {message.author} is rate limited for Instagram link. Time since last processing: {now - last_time:.2f} seconds.")
+        if not runtime_state.allow_user_action(message.author.id, "instagram", RATE_LIMIT_SECONDS):
+            logger.info(f"User {message.author} is rate limited for Instagram link.")
             return
-        user_rate_limit[message.author.id] = now
-        
-        # Extract Instagram URLs
         instagram_urls = [match.group(0) for match in instagram_matches]
         logger.info(f"Processing Instagram links from {message.author} (ID: {message.id}) with URLs: {instagram_urls}")
-        
-        # Process each Instagram link
-        for instagram_url in instagram_urls:
-            # Validate and sanitize the URL
-            validated_url = validate_instagram_url(instagram_url)
-            
-            # Send a processing message
-            processing_msg = await message.channel.send(f"⏳ Downloading Instagram video from <@{message.author.id}>...")
-            
-            # Download the video
-            try:
-                result = await run_blocking(
-                    download_instagram_video,
-                    validated_url,
-                    timeout_seconds=YTDLP_TIMEOUT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"Instagram download timed out for URL: {validated_url}")
-                await delete_message_silently(processing_msg)
-                continue
-            
-            if result['success']:
-                try:
-                    # Check file size (Discord has a file size limit)
-                    original_filepath = result['filepath']
-                    filepath = original_filepath
-                    file_size = os.path.getsize(filepath)
-                    
-                    # Discord's file size limit is 8MB for non-nitro, 50MB for nitro level 1, 100MB for nitro level 2
-                    # We'll use 8MB as a safe limit
-                    max_size = 8 * 1024 * 1024  # 8MB in bytes
-                    
-                    if file_size > max_size:
-                        logger.warning(f"Instagram video too large ({file_size} bytes). Attempting compression.")
-                        compressed_path = None
-                        try:
-                            compressed_path = await run_blocking(
-                                compress_video_to_limit,
-                                filepath,
-                                max_size,
-                                timeout_seconds=FFMPEG_TIMEOUT_SECONDS
-                            )
-                        except asyncio.TimeoutError:
-                            logger.error(f"FFmpeg compression timed out for {filepath}")
-                        if not compressed_path:
-                            # Clean up the file
-                            cleanup_file(filepath)
-                            # Delete the processing message silently
-                            await delete_message_silently(processing_msg)
-                            continue
-                        filepath = compressed_path
-                        file_size = os.path.getsize(filepath)
-                        if file_size > max_size:
-                            logger.warning(f"Compressed Instagram video still too large: {file_size} bytes")
-                            cleanup_file(filepath)
-                            if filepath != original_filepath:
-                                cleanup_file(original_filepath)
-                            await delete_message_silently(processing_msg)
-                            continue
-                        if filepath != original_filepath:
-                            cleanup_file(original_filepath)
-                    # Create a view with buttons for Instagram controls
-                    instagram_view = InstagramControlView(original_url=validated_url, timeout=604800)  # 7 days timeout
-                    instagram_view.original_author_id = message.author.id
-                    
-                    # Upload the video
-                    with open(filepath, 'rb') as f:
-                        file = discord.File(f, filename=os.path.basename(filepath))
-                        # Delete processing message and send new message with file
-                        await processing_msg.delete()
-                        sent_message = await message.channel.send(
-                            content=f"📸 **Instagram video shared by <@{message.author.id}>:**\n{result['title']}",
-                            file=file,
-                            view=instagram_view
-                        )
-                        instagram_view.message = sent_message
-                        logger.info(f"Successfully uploaded Instagram video: {result['title']}")
-                    
-                    # Clean up the file
-                    cleanup_file(filepath)
-                    
-                    # Increment the links processed counter
-                    links_processed += 1
-                    
-                    # Try to delete the original message
-                    try:
-                        await message.delete()
-                        logger.info(f"Deleted original Instagram message {message.id} from {message.author}")
-                    except discord.Forbidden:
-                        logger.warning(f"Missing permissions to delete Instagram message {message.id} from {message.author}")
-                    except discord.HTTPException as e:
-                        logger.error(f"Failed to delete Instagram message {message.id}: {e}")
-                
-                except (discord.HTTPException, discord.Forbidden, OSError, IOError) as e:
-                    logger.error(f"Error uploading Instagram video: {e}")
-                    # Clean up the file if it exists
-                    cleanup_file(result['filepath'])
-                    if 'filepath' in locals() and filepath != result['filepath']:
-                        cleanup_file(filepath)
-                    # Delete the processing message silently
-                    await delete_message_silently(processing_msg)
-            else:
-                logger.error(f"Instagram download failed: {result.get('error', 'Unknown error')}")
-                # Delete the processing message silently
-                await delete_message_silently(processing_msg)
+        links_processed += await process_media_links(
+            message=message,
+            urls=instagram_urls,
+            source_name="Instagram",
+            icon="📸",
+            url_validator=validate_instagram_url_safe,
+            downloader=download_instagram_video,
+            view_factory=lambda url: InstagramControlView(original_url=url, timeout=604800),
+        )
 
 # Run the bot
 client.run(TOKEN)

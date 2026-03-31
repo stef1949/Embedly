@@ -39,7 +39,7 @@ This Discord bot looks for Twitter/X links in messages and automatically replace
    * `/channel_whitelist` - Add or remove channels to the whitelist
 
 ## Prerequisites
-* Python 3.8+
+* Python 3.10+
 * Discord.py 2.0+
 * yt-dlp (for TikTok and Instagram video downloads)
 * FFmpeg (for video processing)
@@ -93,6 +93,23 @@ ffmpeg -encoders | grep nvenc
 ```sh
 python embedbot.py
 ```
+
+## Environment variables
+The bot supports these environment variables (with defaults):
+
+* `DISCORD_BOT_TOKEN` (required)
+* `RATE_LIMIT_SECONDS` (`10`)
+* `GLOBAL_RATE_LIMIT` (`30`)
+* `YTDLP_TIMEOUT_SECONDS` (`120`)
+* `FFPROBE_TIMEOUT_SECONDS` (`15`)
+* `FFMPEG_TIMEOUT_SECONDS` (`120`)
+* `UPLOAD_LIMIT_BYTES` (`8388608`)
+* `DEFAULT_EMULATION` (`true`)
+* `LOG_LEVEL` (`INFO`)
+* `TEMP_DIRECTORY` (`/tmp`)
+* `USE_NVIDIA_GPU` (`false`)
+* `FFMPEG_HEADROOM_RATIO` (`0.95`)
+* `MEDIA_CONCURRENCY` (`3`)
 
 ## User Guide
 
