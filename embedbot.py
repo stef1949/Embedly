@@ -6,9 +6,12 @@ import time
 import sys
 import asyncio
 import subprocess
-from discord.ext import commands
+from typing import Callable
 from tiktok_handler import download_tiktok_video
 from instagram_handler import download_instagram_video
+from config import load_config
+from utils.urls import rewrite_twitter_urls, validate_tiktok_url as validate_tiktok_url_safe, validate_instagram_url as validate_instagram_url_safe
+from services.transcode import compress_video_to_limit as compress_video_to_limit_safe
 
 # Configure logging to show the time, logger name, level, and message.
 logging.basicConfig(
@@ -21,10 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Retrieve the token from an environment variable
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("No Discord token provided. Please set the DISCORD_BOT_TOKEN environment variable.")
+CONFIG = load_config()
+TOKEN = CONFIG.discord_token
 
 # Enable the message content intent (required to read messages)
 intents = discord.Intents.default()
@@ -33,9 +34,6 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
 
-# Regex to match URLs that start with http(s):// and include twitter.com or x.com
-URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:twitter\.com|x\.com)/\S+)', re.IGNORECASE)
-
 # Regex to match TikTok URLs
 TIKTOK_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com)/\S+)', re.IGNORECASE)
 
@@ -43,12 +41,12 @@ TIKTOK_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.c
 INSTAGRAM_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reels?|tv|stories)/\S+)', re.IGNORECASE)
 
 # Rate limiting configuration (per user)
-RATE_LIMIT_SECONDS = 10
+RATE_LIMIT_SECONDS = CONFIG.rate_limit_seconds
 user_rate_limit = {}  # Dictionary mapping user ID to last processed timestamp
 
 # User preferences for emulation (True = emulate user, False = post as bot)
 user_emulation_preferences = {}  # Maps user ID to boolean preference
-DEFAULT_EMULATION = True  # Default to emulating users
+DEFAULT_EMULATION = CONFIG.default_emulation  # Default to emulating users
 
 # Bot statistics
 bot_start_time = time.time()
@@ -56,7 +54,7 @@ links_processed = 0
 version = "1.2.2"  # Bot version
 
 # Security settings
-GLOBAL_RATE_LIMIT = 30  # Maximum requests per minute across all users
+GLOBAL_RATE_LIMIT = CONFIG.global_rate_limit_per_minute  # Maximum requests per minute across all users
 global_request_timestamps = []  # List of timestamps for global rate limiting
 BANNED_USERS = set()  # Set of banned user IDs
 SERVER_BLACKLIST = set()  # Set of blacklisted server IDs
@@ -66,9 +64,11 @@ ADMIN_IDS = set()  # Set of bot admin user IDs
 server_settings = {}  # Maps server ID to settings dict
 
 # Timeouts for blocking operations (seconds)
-YTDLP_TIMEOUT_SECONDS = int(os.getenv("YTDLP_TIMEOUT_SECONDS", "120"))
-FFPROBE_TIMEOUT_SECONDS = int(os.getenv("FFPROBE_TIMEOUT_SECONDS", "15"))
-FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "120"))
+YTDLP_TIMEOUT_SECONDS = CONFIG.ytdlp_timeout_seconds
+FFPROBE_TIMEOUT_SECONDS = CONFIG.ffprobe_timeout_seconds
+FFMPEG_TIMEOUT_SECONDS = CONFIG.ffmpeg_timeout_seconds
+UPLOAD_LIMIT_BYTES = CONFIG.upload_limit_bytes
+media_semaphore = asyncio.Semaphore(CONFIG.media_concurrency)
 
 persistent_views_registered = False
 
@@ -231,10 +231,10 @@ def cleanup_file(filepath):
     except OSError as e:
         logger.warning(f"Failed to clean up file {filepath}: {e}")
 
-async def run_blocking(func, *args, timeout_seconds=None):
+async def run_blocking(func, *args, timeout_seconds=None, **kwargs):
     if timeout_seconds:
-        return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout_seconds)
-    return await asyncio.to_thread(func, *args)
+        return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=timeout_seconds)
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 def get_video_duration_seconds(filepath):
     """Return video duration in seconds using ffprobe, or None on failure"""
@@ -347,6 +347,95 @@ async def delete_message_silently(message):
         logger.debug(f"Could not delete message {message.id}: {e}")
     except Exception as e:
         logger.warning(f"Unexpected error deleting message {message.id}: {e}")
+
+
+async def maybe_delete_original_message(message: discord.Message, context: str) -> None:
+    """Delete a source message with consistent error handling."""
+    try:
+        await message.delete()
+        logger.info(f"Deleted original {context} message {message.id} from {message.author}")
+    except discord.Forbidden:
+        logger.warning(f"Missing permissions to delete {context} message {message.id} from {message.author}")
+    except discord.HTTPException as e:
+        logger.error(f"Failed to delete {context} message {message.id}: {e}")
+
+
+async def process_media_links(
+    *,
+    message: discord.Message,
+    urls: list[str],
+    source_name: str,
+    icon: str,
+    url_validator: Callable[[str], str],
+    downloader: Callable,
+    view_factory: Callable[[str], discord.ui.View],
+) -> int:
+    """Shared media processing flow for TikTok/Instagram links."""
+    processed = 0
+    for source_url in urls:
+        validated_url = url_validator(source_url)
+        processing_msg = await message.channel.send(f"⏳ Downloading {source_name} video from <@{message.author.id}>...")
+        result = None
+        filepath = None
+        original_filepath = None
+        try:
+            async with media_semaphore:
+                result = await run_blocking(
+                    downloader,
+                    validated_url,
+                    output_folder=CONFIG.temp_directory,
+                    timeout_seconds=YTDLP_TIMEOUT_SECONDS,
+                )
+            if not result or not result.get("success"):
+                logger.error("%s download failed: %s", source_name, result.get("error", "Unknown error") if result else "Unknown error")
+                continue
+
+            original_filepath = result["filepath"]
+            filepath = original_filepath
+            file_size = os.path.getsize(filepath)
+            if file_size > UPLOAD_LIMIT_BYTES:
+                compressed_path = await run_blocking(
+                    compress_video_to_limit_safe,
+                    filepath,
+                    UPLOAD_LIMIT_BYTES,
+                    ffprobe_timeout_seconds=FFPROBE_TIMEOUT_SECONDS,
+                    ffmpeg_timeout_seconds=FFMPEG_TIMEOUT_SECONDS,
+                    headroom_ratio=CONFIG.ffmpeg_headroom_ratio,
+                    use_nvidia_gpu=CONFIG.use_nvidia_gpu,
+                    timeout_seconds=FFMPEG_TIMEOUT_SECONDS,
+                )
+                if not compressed_path:
+                    logger.warning("%s compression failed for %s", source_name, filepath)
+                    continue
+                filepath = compressed_path
+                if os.path.getsize(filepath) > UPLOAD_LIMIT_BYTES:
+                    logger.warning("Compressed %s video still exceeds upload limit: %s", source_name, filepath)
+                    continue
+
+            media_view = view_factory(validated_url)
+            media_view.original_author_id = message.author.id
+            with open(filepath, "rb") as media_file:
+                file = discord.File(media_file, filename=os.path.basename(filepath))
+                await delete_message_silently(processing_msg)
+                sent_message = await message.channel.send(
+                    content=f"{icon} **{source_name} video shared by <@{message.author.id}>:**\n{result.get('title', 'Unknown Title')}",
+                    file=file,
+                    view=media_view,
+                )
+                media_view.message = sent_message
+            processed += 1
+            await maybe_delete_original_message(message, source_name)
+        except asyncio.TimeoutError:
+            logger.error("%s operation timed out for URL: %s", source_name, validated_url)
+        except (discord.HTTPException, discord.Forbidden, OSError, IOError) as e:
+            logger.error("Error processing %s video %s: %s", source_name, validated_url, e)
+        finally:
+            await delete_message_silently(processing_msg)
+            if filepath:
+                cleanup_file(filepath)
+            if original_filepath and original_filepath != filepath:
+                cleanup_file(original_filepath)
+    return processed
 
 # Security event logging
 def log_security_event(event_type, user_id, guild_id=None, details=None):
@@ -1303,22 +1392,10 @@ async def on_message(message):
         logger.warning("Global rate limit exceeded, ignoring message")
         return
 
-    # Process only messages that contain twitter.com or x.com links using re.finditer
-    matches = list(URL_REGEX.finditer(message.content))
-    if matches:
-        spoiler_urls = []
-        non_spoiler_urls = []
-        for match in matches:
-            url = match.group(0)
-            start_index = match.start()
-            end_index = match.end()
-            # Check if the URL is wrapped in spoiler tags '||'
-            if start_index >= 2 and end_index + 2 <= len(message.content) and \
-               message.content[start_index-2:start_index] == "||" and \
-               message.content[end_index:end_index+2] == "||":
-                spoiler_urls.append(url)
-            else:
-                non_spoiler_urls.append(url)
+    rewrite_result = rewrite_twitter_urls(message.content)
+    if rewrite_result.rewritten_urls or rewrite_result.spoiler_urls:
+        spoiler_urls = rewrite_result.spoiler_urls
+        non_spoiler_urls = rewrite_result.rewritten_urls
         
         now = time.time()
         last_time = user_rate_limit.get(message.author.id, 0)
@@ -1339,10 +1416,7 @@ async def on_message(message):
         if spoiler_urls:
             logger.info(f"Processing spoilered message from {message.author} (ID: {message.id}) with URLs: {spoiler_urls}")
 
-            # Sanitize and convert URLs
-            spoiler_urls = [sanitize_url(url) for url in spoiler_urls]
-            modified_spoiler_urls = [re.sub(r'(twitter\.com|x\.com)', 'vxtwitter.com', url, flags=re.IGNORECASE) for url in spoiler_urls]
-            spoiler_response = "\n".join(modified_spoiler_urls)
+            spoiler_response = "\n".join(spoiler_urls)
 
             links_processed += len(spoiler_urls)
 
@@ -1365,9 +1439,7 @@ async def on_message(message):
 
         if non_spoiler_urls:
             logger.info(f"Processing message from {message.author} (ID: {message.id}) with URLs: {non_spoiler_urls}")
-            non_spoiler_urls = [sanitize_url(url) for url in non_spoiler_urls]
-            modified_urls = [re.sub(r'(twitter\.com|x\.com)', 'vxtwitter.com', url, flags=re.IGNORECASE) for url in non_spoiler_urls]
-            response = "\n".join(modified_urls)
+            response = "\n".join(non_spoiler_urls)
 
             links_processed += len(non_spoiler_urls)
 
@@ -1443,242 +1515,44 @@ async def on_message(message):
     # Process TikTok links
     tiktok_matches = list(TIKTOK_URL_REGEX.finditer(message.content))
     if tiktok_matches:
-        # Check rate limit
         now = time.time()
         last_time = user_rate_limit.get(message.author.id, 0)
         if now - last_time < RATE_LIMIT_SECONDS:
             logger.info(f"User {message.author} is rate limited for TikTok link. Time since last processing: {now - last_time:.2f} seconds.")
             return
         user_rate_limit[message.author.id] = now
-        
-        # Extract TikTok URLs
         tiktok_urls = [match.group(0) for match in tiktok_matches]
         logger.info(f"Processing TikTok links from {message.author} (ID: {message.id}) with URLs: {tiktok_urls}")
-        
-        # Process each TikTok link
-        for tiktok_url in tiktok_urls:
-            # Validate and sanitize the URL
-            validated_url = validate_tiktok_url(tiktok_url)
-            
-            # Send a processing message
-            processing_msg = await message.channel.send(f"⏳ Downloading TikTok video from <@{message.author.id}>...")
-            
-            # Download the video
-            try:
-                result = await run_blocking(
-                    download_tiktok_video,
-                    validated_url,
-                    timeout_seconds=YTDLP_TIMEOUT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"TikTok download timed out for URL: {validated_url}")
-                await delete_message_silently(processing_msg)
-                continue
-            
-            if result['success']:
-                try:
-                    # Check file size (Discord has a file size limit)
-                    original_filepath = result['filepath']
-                    filepath = original_filepath
-                    file_size = os.path.getsize(filepath)
-                    
-                    # Discord's file size limit is 8MB for non-nitro, 50MB for nitro level 1, 100MB for nitro level 2
-                    # We'll use 8MB as a safe limit
-                    max_size = 8 * 1024 * 1024  # 8MB in bytes
-                    
-                    if file_size > max_size:
-                        logger.warning(f"TikTok video too large ({file_size} bytes). Attempting compression.")
-                        compressed_path = None
-                        try:
-                            compressed_path = await run_blocking(
-                                compress_video_to_limit,
-                                filepath,
-                                max_size,
-                                timeout_seconds=FFMPEG_TIMEOUT_SECONDS
-                            )
-                        except asyncio.TimeoutError:
-                            logger.error(f"FFmpeg compression timed out for {filepath}")
-                        if not compressed_path:
-                            # Clean up the file
-                            cleanup_file(filepath)
-                            # Delete the processing message silently
-                            await delete_message_silently(processing_msg)
-                            continue
-                        filepath = compressed_path
-                        file_size = os.path.getsize(filepath)
-                        if file_size > max_size:
-                            logger.warning(f"Compressed TikTok video still too large: {file_size} bytes")
-                            cleanup_file(filepath)
-                            if filepath != original_filepath:
-                                cleanup_file(original_filepath)
-                            await delete_message_silently(processing_msg)
-                            continue
-                        if filepath != original_filepath:
-                            cleanup_file(original_filepath)
-                    # Create a view with buttons for TikTok controls
-                    tiktok_view = TikTokControlView(original_url=validated_url, timeout=604800)  # 7 days timeout
-                    tiktok_view.original_author_id = message.author.id
-                    
-                    # Upload the video
-                    with open(filepath, 'rb') as f:
-                        file = discord.File(f, filename=os.path.basename(filepath))
-                        # Delete processing message and send new message with file
-                        await processing_msg.delete()
-                        sent_message = await message.channel.send(
-                            content=f"🎵 **TikTok video shared by <@{message.author.id}>:**\n{result['title']}",
-                            file=file,
-                            view=tiktok_view
-                        )
-                        tiktok_view.message = sent_message
-                        logger.info(f"Successfully uploaded TikTok video: {result['title']}")
-                    
-                    # Clean up the file
-                    cleanup_file(filepath)
-                    
-                    # Increment the links processed counter
-                    links_processed += 1
-                    
-                    # Try to delete the original message
-                    try:
-                        await message.delete()
-                        logger.info(f"Deleted original TikTok message {message.id} from {message.author}")
-                    except discord.Forbidden:
-                        logger.warning(f"Missing permissions to delete TikTok message {message.id} from {message.author}")
-                    except discord.HTTPException as e:
-                        logger.error(f"Failed to delete TikTok message {message.id}: {e}")
-                
-                except (discord.HTTPException, discord.Forbidden, OSError, IOError) as e:
-                    logger.error(f"Error uploading TikTok video: {e}")
-                    # Clean up the file if it exists
-                    cleanup_file(result['filepath'])
-                    if 'filepath' in locals() and filepath != result['filepath']:
-                        cleanup_file(filepath)
-                    # Delete the processing message silently
-                    await delete_message_silently(processing_msg)
-            else:
-                logger.error(f"TikTok download failed: {result.get('error', 'Unknown error')}")
-                # Delete the processing message silently
-                await delete_message_silently(processing_msg)
-    
+        links_processed += await process_media_links(
+            message=message,
+            urls=tiktok_urls,
+            source_name="TikTok",
+            icon="🎵",
+            url_validator=validate_tiktok_url_safe,
+            downloader=download_tiktok_video,
+            view_factory=lambda url: TikTokControlView(original_url=url, timeout=604800),
+        )
+
     # Process Instagram links
     instagram_matches = list(INSTAGRAM_URL_REGEX.finditer(message.content))
     if instagram_matches:
-        # Check rate limit
         now = time.time()
         last_time = user_rate_limit.get(message.author.id, 0)
         if now - last_time < RATE_LIMIT_SECONDS:
             logger.info(f"User {message.author} is rate limited for Instagram link. Time since last processing: {now - last_time:.2f} seconds.")
             return
         user_rate_limit[message.author.id] = now
-        
-        # Extract Instagram URLs
         instagram_urls = [match.group(0) for match in instagram_matches]
         logger.info(f"Processing Instagram links from {message.author} (ID: {message.id}) with URLs: {instagram_urls}")
-        
-        # Process each Instagram link
-        for instagram_url in instagram_urls:
-            # Validate and sanitize the URL
-            validated_url = validate_instagram_url(instagram_url)
-            
-            # Send a processing message
-            processing_msg = await message.channel.send(f"⏳ Downloading Instagram video from <@{message.author.id}>...")
-            
-            # Download the video
-            try:
-                result = await run_blocking(
-                    download_instagram_video,
-                    validated_url,
-                    timeout_seconds=YTDLP_TIMEOUT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"Instagram download timed out for URL: {validated_url}")
-                await delete_message_silently(processing_msg)
-                continue
-            
-            if result['success']:
-                try:
-                    # Check file size (Discord has a file size limit)
-                    original_filepath = result['filepath']
-                    filepath = original_filepath
-                    file_size = os.path.getsize(filepath)
-                    
-                    # Discord's file size limit is 8MB for non-nitro, 50MB for nitro level 1, 100MB for nitro level 2
-                    # We'll use 8MB as a safe limit
-                    max_size = 8 * 1024 * 1024  # 8MB in bytes
-                    
-                    if file_size > max_size:
-                        logger.warning(f"Instagram video too large ({file_size} bytes). Attempting compression.")
-                        compressed_path = None
-                        try:
-                            compressed_path = await run_blocking(
-                                compress_video_to_limit,
-                                filepath,
-                                max_size,
-                                timeout_seconds=FFMPEG_TIMEOUT_SECONDS
-                            )
-                        except asyncio.TimeoutError:
-                            logger.error(f"FFmpeg compression timed out for {filepath}")
-                        if not compressed_path:
-                            # Clean up the file
-                            cleanup_file(filepath)
-                            # Delete the processing message silently
-                            await delete_message_silently(processing_msg)
-                            continue
-                        filepath = compressed_path
-                        file_size = os.path.getsize(filepath)
-                        if file_size > max_size:
-                            logger.warning(f"Compressed Instagram video still too large: {file_size} bytes")
-                            cleanup_file(filepath)
-                            if filepath != original_filepath:
-                                cleanup_file(original_filepath)
-                            await delete_message_silently(processing_msg)
-                            continue
-                        if filepath != original_filepath:
-                            cleanup_file(original_filepath)
-                    # Create a view with buttons for Instagram controls
-                    instagram_view = InstagramControlView(original_url=validated_url, timeout=604800)  # 7 days timeout
-                    instagram_view.original_author_id = message.author.id
-                    
-                    # Upload the video
-                    with open(filepath, 'rb') as f:
-                        file = discord.File(f, filename=os.path.basename(filepath))
-                        # Delete processing message and send new message with file
-                        await processing_msg.delete()
-                        sent_message = await message.channel.send(
-                            content=f"📸 **Instagram video shared by <@{message.author.id}>:**\n{result['title']}",
-                            file=file,
-                            view=instagram_view
-                        )
-                        instagram_view.message = sent_message
-                        logger.info(f"Successfully uploaded Instagram video: {result['title']}")
-                    
-                    # Clean up the file
-                    cleanup_file(filepath)
-                    
-                    # Increment the links processed counter
-                    links_processed += 1
-                    
-                    # Try to delete the original message
-                    try:
-                        await message.delete()
-                        logger.info(f"Deleted original Instagram message {message.id} from {message.author}")
-                    except discord.Forbidden:
-                        logger.warning(f"Missing permissions to delete Instagram message {message.id} from {message.author}")
-                    except discord.HTTPException as e:
-                        logger.error(f"Failed to delete Instagram message {message.id}: {e}")
-                
-                except (discord.HTTPException, discord.Forbidden, OSError, IOError) as e:
-                    logger.error(f"Error uploading Instagram video: {e}")
-                    # Clean up the file if it exists
-                    cleanup_file(result['filepath'])
-                    if 'filepath' in locals() and filepath != result['filepath']:
-                        cleanup_file(filepath)
-                    # Delete the processing message silently
-                    await delete_message_silently(processing_msg)
-            else:
-                logger.error(f"Instagram download failed: {result.get('error', 'Unknown error')}")
-                # Delete the processing message silently
-                await delete_message_silently(processing_msg)
+        links_processed += await process_media_links(
+            message=message,
+            urls=instagram_urls,
+            source_name="Instagram",
+            icon="📸",
+            url_validator=validate_instagram_url_safe,
+            downloader=download_instagram_video,
+            view_factory=lambda url: InstagramControlView(original_url=url, timeout=604800),
+        )
 
 # Run the bot
 client.run(TOKEN)
