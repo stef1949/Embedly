@@ -1,4 +1,4 @@
-<h1 align="center"> vxtwitter Link Bot </h1> <p align="center"> <img src="https://github.com/stef1949/Vxtwitter-Link-Embedder/blob/main/38CD6CE0-EFF2-48DE-9487-75D414D104E8.png?raw=true " width="200"> <p/>
+<h1 align="center"> vxtwitter Link Bot </h1> <p align="center"> <img src="https://github.com/stef1949/Embedly/blob/6fb0f80cd5a015ea1fee0abdde3fc95e007ad1b6/IMG_3072.png?raw=true " width="200"> <p/>
 
 This Discord bot looks for Twitter/X links in messages and automatically replaces them with `vxtwitter.com` links. It also supports downloading and sharing TikTok and Instagram videos directly in Discord. It includes user identity emulation, interactive buttons, and comprehensive admin controls.
 
