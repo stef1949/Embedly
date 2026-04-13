@@ -1,4 +1,5 @@
 import unittest
+from urllib.parse import urlparse
 
 from utils.urls import rewrite_twitter_urls, is_tiktok_url, is_instagram_url, validate_tiktok_url, validate_instagram_url
 
@@ -8,7 +9,7 @@ class UrlTests(unittest.TestCase):
         text = "check https://twitter.com/a/status/1 and https://mobile.x.com/b/status/2"
         result = rewrite_twitter_urls(text)
         self.assertEqual(len(result.rewritten_urls), 2)
-        self.assertTrue(all("vxtwitter.com" in url for url in result.rewritten_urls))
+        self.assertTrue(all(urlparse(url).hostname == "vxtwitter.com" for url in result.rewritten_urls))
 
     def test_spoiler_link(self):
         text = "||https://x.com/a/status/1||"
