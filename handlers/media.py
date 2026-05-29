@@ -67,6 +67,7 @@ async def process_media_links(
     view_factory: Callable[[str], discord.ui.View],
     semaphore: asyncio.Semaphore,
     config: MediaProcessingConfig,
+    embed_factory: Callable[[DownloadResult, str], discord.Embed] | None = None,
 ) -> int:
     processed = 0
     for source_url in urls:
@@ -114,14 +115,21 @@ async def process_media_links(
 
             media_view = view_factory(validated_url)
             media_view.original_author_id = message.author.id
+            embed = embed_factory(result, validated_url) if embed_factory else None
             with open(filepath, "rb") as media_file:
                 file = discord.File(media_file, filename=os.path.basename(filepath))
                 await delete_message_silently(processing_msg)
-                sent_message = await message.channel.send(
-                    content=f"{icon} **{source_name} video shared by <@{message.author.id}>:**\n{result.title}",
-                    file=file,
-                    view=media_view,
-                )
+                content = f"{icon} **{source_name} video shared by <@{message.author.id}>:**"
+                if embed is None:
+                    content = f"{content}\n{result.title}"
+                send_kwargs = {
+                    "content": content,
+                    "file": file,
+                    "view": media_view,
+                }
+                if embed is not None:
+                    send_kwargs["embed"] = embed
+                sent_message = await message.channel.send(**send_kwargs)
                 media_view.message = sent_message
 
             processed += 1

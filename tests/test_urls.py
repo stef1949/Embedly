@@ -1,7 +1,15 @@
 import unittest
 from urllib.parse import urlparse
 
-from utils.urls import rewrite_twitter_urls, is_tiktok_url, is_instagram_url, validate_tiktok_url, validate_instagram_url
+from utils.urls import (
+    rewrite_twitter_urls,
+    is_tiktok_url,
+    is_instagram_url,
+    is_youtube_url,
+    validate_tiktok_url,
+    validate_instagram_url,
+    validate_youtube_url,
+)
 
 
 class UrlTests(unittest.TestCase):
@@ -26,10 +34,13 @@ class UrlTests(unittest.TestCase):
     def test_platform_matchers(self):
         self.assertTrue(is_tiktok_url("https://www.tiktok.com/@user/video/1"))
         self.assertTrue(is_instagram_url("https://www.instagram.com/reel/abc"))
+        self.assertTrue(is_youtube_url("https://www.youtube.com/watch?v=abc123"))
+        self.assertTrue(is_youtube_url("https://youtu.be/abc123"))
 
     def test_validation_sanitizes(self):
         self.assertEqual(validate_tiktok_url("https://www.tiktok.com/@user/video/1!!!"), "https://www.tiktok.com/@user/video/1")
         self.assertEqual(validate_instagram_url("https://www.instagram.com/reel/abc123),"), "https://www.instagram.com/reel/abc123")
+        self.assertEqual(validate_youtube_url("https://youtu.be/abc123),"), "https://youtu.be/abc123")
 
 
 if __name__ == "__main__":

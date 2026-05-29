@@ -7,6 +7,14 @@ from urllib.parse import urlsplit, urlunsplit
 TWITTER_HOSTS = {"twitter.com", "www.twitter.com", "mobile.twitter.com", "x.com", "www.x.com", "mobile.x.com"}
 TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "vm.tiktok.com"}
 INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com", "instagr.am", "www.instagr.am"}
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+}
 
 URL_REGEX = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
 TRAILING_PUNCTUATION = ".,!?;:)]}"
@@ -20,6 +28,12 @@ _TIKTOK_PATHS = (
 _INSTAGRAM_PATHS = (
     re.compile(r"^/(?:p|reel|reels|tv)/[\w\-]+/?$", re.IGNORECASE),
     re.compile(r"^/stories/[\w\.]+/\d+/?$", re.IGNORECASE),
+)
+
+_YOUTUBE_PATHS = (
+    re.compile(r"^/watch$", re.IGNORECASE),
+    re.compile(r"^/(?:shorts|live|embed|v)/[\w\-]+/?$", re.IGNORECASE),
+    re.compile(r"^/[\w\-]+/?$", re.IGNORECASE),
 )
 
 
@@ -92,6 +106,19 @@ def validate_instagram_url(url: str) -> str:
     return clean
 
 
+def validate_youtube_url(url: str) -> str:
+    clean = _strip_trailing_punctuation(sanitize_url(url))
+    parsed = urlsplit(clean)
+    host = _normalize_host(parsed.hostname)
+    if host not in YOUTUBE_HOSTS:
+        return clean
+    if host.endswith("youtu.be") and any(pattern.match(parsed.path or "") for pattern in _YOUTUBE_PATHS):
+        return clean
+    if any(pattern.match(parsed.path or "") for pattern in _YOUTUBE_PATHS):
+        return clean
+    return clean
+
+
 def is_tiktok_url(url: str) -> bool:
     parsed = urlsplit(url)
     return _normalize_host(parsed.hostname) in TIKTOK_HOSTS
@@ -100,3 +127,8 @@ def is_tiktok_url(url: str) -> bool:
 def is_instagram_url(url: str) -> bool:
     parsed = urlsplit(url)
     return _normalize_host(parsed.hostname) in INSTAGRAM_HOSTS
+
+
+def is_youtube_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    return _normalize_host(parsed.hostname) in YOUTUBE_HOSTS

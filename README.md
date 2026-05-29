@@ -6,8 +6,9 @@ This Discord bot looks for Twitter/X links in messages and automatically replace
 
 ### Core Functionality
 * **URL Replacement:** Finds URLs containing `twitter.com` or `x.com` and replaces them with `vxtwitter.com`
-* **TikTok Video Downloads:** Automatically downloads and shares TikTok videos when TikTok links are posted
-* **Instagram Video Downloads:** Automatically downloads and shares Instagram videos/reels when Instagram links are posted
+* **TikTok Video Downloads:** Automatically downloads and shares TikTok videos with available engagement metadata when TikTok links are posted
+* **Instagram Video Downloads:** Automatically downloads and shares Instagram videos/reels with available engagement metadata when Instagram links are posted
+* **YouTube Video Downloads:** Automatically downloads and shares YouTube videos/shorts with available engagement metadata when YouTube links are posted
 * **User Emulation:** Can post links either as the original user (with their name and avatar) or as the bot with attribution
 * **Interactive Buttons:**
    * **Delete Button:** Lets the original message sender remove the bot's response
@@ -41,7 +42,7 @@ This Discord bot looks for Twitter/X links in messages and automatically replace
 ## Prerequisites
 * Python 3.10+
 * Discord.py 2.0+
-* yt-dlp (for TikTok and Instagram video downloads)
+* yt-dlp (for TikTok, Instagram, and YouTube video downloads)
 * FFmpeg (for video processing)
 * A Discord bot token
 * *Optional:* NVIDIA GPU with NVENC support for hardware-accelerated video encoding
@@ -101,8 +102,9 @@ The codebase is organized into focused modules:
 
 * `embedbot.py` - bot entrypoint and Discord event/command wiring
 * `handlers/twitter.py` - Twitter/X rewrite message send flow
-* `handlers/media.py` - shared TikTok/Instagram processing pipeline
+* `handlers/media.py` - shared TikTok/Instagram/YouTube processing pipeline
 * `services/downloaders.py` - yt-dlp download abstraction
+* `services/media_embeds.py` - shared metadata embed formatting
 * `services/transcode.py` - ffmpeg/ffprobe helpers and compression
 * `utils/urls.py` - URL parsing/validation/rewriting logic
 * `views.py` - persistent Discord UI control views
@@ -132,6 +134,7 @@ The bot supports these environment variables (with defaults):
 When you share a TikTok link in a channel where the bot is active:
 * The bot automatically downloads the video using yt-dlp
 * The video is uploaded directly to Discord (if under 8MB file size limit)
+* The Discord embed includes available TikTok metadata such as likes, comments/messages, views, creator, posted date, duration, size, caption, and thumbnail
 * The original message is deleted and replaced with the downloaded video
 * The bot attributes the video to you with a mention
 
@@ -141,6 +144,7 @@ When you share a TikTok link in a channel where the bot is active:
 When you share an Instagram link (posts, reels, IGTV) in a channel where the bot is active:
 * The bot automatically downloads the video using yt-dlp
 * The video is uploaded directly to Discord (if under 8MB file size limit)
+* The Discord embed includes available Instagram metadata such as likes, comments/messages, views, creator, posted date, duration, size, caption, and thumbnail
 * The original message is deleted and replaced with the downloaded video
 * The bot attributes the video to you with a mention
 
@@ -149,6 +153,22 @@ When you share an Instagram link (posts, reels, IGTV) in a channel where the bot
 * Reels: `https://www.instagram.com/reel/...` or `https://www.instagram.com/reels/...`
 * IGTV: `https://www.instagram.com/tv/...`
 * Stories: `https://www.instagram.com/stories/...`
+
+**Note:** Videos larger than 8MB cannot be uploaded due to Discord's file size limits.
+
+### YouTube Video Downloads
+When you share a YouTube link in a channel where the bot is active:
+* The bot automatically downloads the video using yt-dlp
+* The video is uploaded directly to Discord (if under 8MB file size limit)
+* The Discord embed includes available YouTube metadata such as likes, comments/messages, views, creator, posted date, duration, size, description, and thumbnail
+* The original message is deleted and replaced with the downloaded video
+* The bot attributes the video to you with a mention
+
+**Supported YouTube URL formats:**
+* Videos: `https://www.youtube.com/watch?v=...`
+* Shorts: `https://www.youtube.com/shorts/...`
+* Live videos: `https://www.youtube.com/live/...`
+* Short links: `https://youtu.be/...`
 
 **Note:** Videos larger than 8MB cannot be uploaded due to Discord's file size limits.
 

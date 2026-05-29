@@ -7,12 +7,24 @@ import sys
 import asyncio
 import subprocess
 from typing import Callable
-from tiktok_handler import download_tiktok_video
-from instagram_handler import download_instagram_video
+from tiktok_handler import build_tiktok_embed, download_tiktok_video
+from instagram_handler import build_instagram_embed, download_instagram_video
+from youtube_handler import build_youtube_embed, download_youtube_video
 from config import load_config
-from utils.urls import rewrite_twitter_urls, validate_tiktok_url as validate_tiktok_url_safe, validate_instagram_url as validate_instagram_url_safe
+from utils.urls import (
+    rewrite_twitter_urls,
+    validate_instagram_url as validate_instagram_url_safe,
+    validate_tiktok_url as validate_tiktok_url_safe,
+    validate_youtube_url as validate_youtube_url_safe,
+)
 from services.transcode import compress_video_to_limit as compress_video_to_limit_safe
-from views import MessageControlView, TikTokControlView, InstagramControlView, configure_view_context
+from views import (
+    InstagramControlView,
+    MessageControlView,
+    TikTokControlView,
+    YouTubeControlView,
+    configure_view_context,
+)
 from handlers.media import MediaProcessingConfig, process_media_links as process_media_links_shared
 from handlers.twitter import send_twitter_rewrite_message
 from runtime_state import RuntimeState
@@ -43,6 +55,14 @@ TIKTOK_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.c
 
 # Regex to match Instagram URLs (posts, reels, stories, and short URLs)
 INSTAGRAM_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reels?|tv|stories)/\S+)', re.IGNORECASE)
+
+# Regex to match YouTube URLs (videos, shorts, live videos, embeds, and youtu.be links)
+YOUTUBE_URL_REGEX = re.compile(
+    r'(https?://(?:(?:www\.|m\.|music\.)?youtube\.com/(?:'
+    r'watch\?\S*?v=[\w\-]+\S*|shorts/[\w\-]+\S*|live/[\w\-]+\S*|'
+    r'embed/[\w\-]+\S*|v/[\w\-]+\S*)|(?:www\.)?youtu\.be/[\w\-]+\S*))',
+    re.IGNORECASE,
+)
 
 # Rate limiting configuration (per user)
 RATE_LIMIT_SECONDS = CONFIG.rate_limit_seconds
@@ -844,6 +864,7 @@ def register_persistent_views():
     client.add_view(MessageControlView(timeout=None))
     client.add_view(TikTokControlView(original_url="https://example.com", timeout=None))
     client.add_view(InstagramControlView(original_url="https://example.com", timeout=None))
+    client.add_view(YouTubeControlView(original_url="https://example.com", timeout=None))
     persistent_views_registered = True
     logger.info("Registered persistent views")
 
@@ -1043,6 +1064,7 @@ async def on_message(message):
             compressor=compress_video_to_limit_safe,
             semaphore=media_semaphore,
             config=media_config,
+            embed_factory=build_tiktok_embed,
         )
 
     # Process Instagram links
@@ -1064,6 +1086,29 @@ async def on_message(message):
             compressor=compress_video_to_limit_safe,
             semaphore=media_semaphore,
             config=media_config,
+            embed_factory=build_instagram_embed,
+        )
+
+    # Process YouTube links
+    youtube_matches = list(YOUTUBE_URL_REGEX.finditer(message.content))
+    if youtube_matches:
+        if not runtime_state.allow_user_action(message.author.id, "youtube", RATE_LIMIT_SECONDS):
+            logger.info(f"User {message.author} is rate limited for YouTube link.")
+            return
+        youtube_urls = [match.group(0) for match in youtube_matches]
+        logger.info(f"Processing YouTube links from {message.author} (ID: {message.id}) with URLs: {youtube_urls}")
+        links_processed += await process_media_links_shared(
+            message=message,
+            urls=youtube_urls,
+            source_name="YouTube",
+            icon="YT",
+            url_validator=validate_youtube_url_safe,
+            downloader=download_youtube_video,
+            view_factory=lambda url: YouTubeControlView(original_url=url, timeout=604800),
+            compressor=compress_video_to_limit_safe,
+            semaphore=media_semaphore,
+            config=media_config,
+            embed_factory=build_youtube_embed,
         )
 
 # Run the bot

@@ -4,7 +4,8 @@ import glob
 import logging
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import yt_dlp
 
@@ -17,6 +18,7 @@ class DownloadResult:
     filepath: str | None = None
     title: str = "Unknown Title"
     error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _build_opts(output_folder: str, use_nvidia_gpu: bool) -> dict:
@@ -43,9 +45,11 @@ def download_video(video_url: str, output_folder: str | None = None, use_nvidia_
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            metadata = ydl.extract_info(video_url, download=False)
-            title = metadata.get("title", "Unknown Title")
-            info = ydl.extract_info(video_url, download=True)
+            metadata = ydl.extract_info(video_url, download=False) or {}
+            title = metadata.get("title") or "Unknown Title"
+            info = ydl.extract_info(video_url, download=True) or {}
+            merged_metadata = {**metadata, **info}
+            title = str(merged_metadata.get("title") or title or "Unknown Title")
             filepath = ydl.prepare_filename(info)
             if not os.path.exists(filepath):
                 video_id = info.get("id", "")
@@ -53,8 +57,13 @@ def download_video(video_url: str, output_folder: str | None = None, use_nvidia_
                 if matches:
                     filepath = matches[0]
                 else:
-                    return DownloadResult(success=False, title=title, error=f"Downloaded file missing for {video_id}")
-            return DownloadResult(success=True, filepath=filepath, title=title)
+                    return DownloadResult(
+                        success=False,
+                        title=title,
+                        error=f"Downloaded file missing for {video_id}",
+                        metadata=merged_metadata,
+                    )
+            return DownloadResult(success=True, filepath=filepath, title=title, metadata=merged_metadata)
     except yt_dlp.utils.DownloadError as exc:
         logger.error("yt-dlp download failed for %s: %s", video_url, exc)
         return DownloadResult(success=False, error=f"DownloadError: {exc}")

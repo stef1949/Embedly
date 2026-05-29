@@ -130,3 +130,9 @@ class InstagramControlView(MediaControlView):
     @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, custom_id="instagram_delete_button")
     async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._handle_delete(interaction)
+
+
+class YouTubeControlView(MediaControlView):
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, custom_id="youtube_delete_button")
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_delete(interaction)
