@@ -8,6 +8,10 @@ from views import MessageControlView
 
 logger = logging.getLogger(__name__)
 
+WEBHOOK_NAME = "Embedly"
+LEGACY_WEBHOOK_NAMES = {"TempWebhook"}
+_webhook_cache: dict[int, discord.Webhook] = {}
+
 
 async def send_twitter_rewrite_message(
     *,
@@ -52,25 +56,76 @@ async def _send_with_optional_emulation(
     if emulate and isinstance(message.channel, discord.TextChannel):
         perms = message.channel.permissions_for(message.guild.me)
         if perms.manage_webhooks:
-            webhook = None
             try:
-                webhook = await message.channel.create_webhook(name="TempWebhook")
-                sent = await webhook.send(
-                    content=content,
-                    username=message.author.display_name,
-                    avatar_url=message.author.display_avatar.url,
-                    view=view,
-                    wait=True,
-                )
-                return sent
+                webhook = await _get_or_create_channel_webhook(message.channel, bot_user=message.guild.me)
+                if webhook:
+                    sent = await webhook.send(
+                        content=content,
+                        username=message.author.display_name,
+                        avatar_url=message.author.display_avatar.url,
+                        view=view,
+                        wait=True,
+                    )
+                    return sent
             except discord.HTTPException as exc:
                 logger.warning("Webhook send failed for %s: %s", message.id, exc)
-            finally:
-                if webhook:
-                    try:
-                        await webhook.delete()
-                    except discord.HTTPException as exc:
-                        logger.warning("Webhook delete failed for %s: %s", message.id, exc)
+                _webhook_cache.pop(message.channel.id, None)
 
     user_id_mention = f"<@{message.author.id}>"
     return await message.channel.send(f"**Link shared by {user_id_mention}:**\n{content}", view=view)
+
+
+async def _get_or_create_channel_webhook(
+    channel: discord.TextChannel,
+    *,
+    bot_user: discord.abc.User,
+) -> discord.Webhook | None:
+    cached = _webhook_cache.get(channel.id)
+    if cached:
+        return cached
+
+    reusable_webhook = await _find_reusable_webhook(channel, bot_user=bot_user)
+    if reusable_webhook:
+        _webhook_cache[channel.id] = reusable_webhook
+        return reusable_webhook
+
+    try:
+        webhook = await channel.create_webhook(name=WEBHOOK_NAME)
+    except discord.HTTPException as exc:
+        if getattr(exc, "code", None) == 30007:
+            logger.info("Channel %s has the maximum number of webhooks; falling back to bot identity", channel.id)
+        else:
+            logger.warning("Could not create reusable webhook for channel %s: %s", channel.id, exc)
+        return None
+
+    _webhook_cache[channel.id] = webhook
+    return webhook
+
+
+async def _find_reusable_webhook(
+    channel: discord.TextChannel,
+    *,
+    bot_user: discord.abc.User,
+) -> discord.Webhook | None:
+    try:
+        webhooks = await channel.webhooks()
+    except discord.HTTPException as exc:
+        logger.warning("Could not list webhooks for channel %s: %s", channel.id, exc)
+        return None
+
+    owned_by_bot = [webhook for webhook in webhooks if _webhook_belongs_to_bot(webhook, bot_user)]
+    for webhook in owned_by_bot:
+        if webhook.name == WEBHOOK_NAME:
+            return webhook
+
+    for webhook in owned_by_bot:
+        if webhook.name in LEGACY_WEBHOOK_NAMES:
+            return webhook
+
+    return None
+
+
+def _webhook_belongs_to_bot(webhook: discord.Webhook, bot_user: discord.abc.User) -> bool:
+    webhook_user = getattr(webhook, "user", None)
+    webhook_user_id = getattr(webhook_user, "id", None)
+    return webhook_user_id == bot_user.id
