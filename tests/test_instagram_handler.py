@@ -5,7 +5,7 @@ from services.downloaders import DownloadResult
 
 
 class InstagramEmbedTests(unittest.TestCase):
-    def test_build_instagram_embed_includes_engagement_and_details(self):
+    def test_build_instagram_embed_includes_horizontal_engagement(self):
         result = DownloadResult(
             success=True,
             title="Fallback title",
@@ -32,9 +32,32 @@ class InstagramEmbedTests(unittest.TestCase):
         self.assertEqual(embed.title, "Post title")
         self.assertEqual(embed.description, "Caption text")
         self.assertEqual(embed.thumbnail.url, "https://example.com/thumb.jpg")
-        self.assertIn("Likes: 12,345", fields["Engagement"])
-        self.assertIn("Comments: 67", fields["Engagement"])
-        self.assertIn("Views: 890", fields["Engagement"])
+        self.assertEqual(fields["Engagement"], "❤️ Likes: 12,345 | 💬 Comments: 67 | 👁️ Views: 890")
+        self.assertNotIn("\n", fields["Engagement"])
+        self.assertNotIn("Details", fields)
+
+    def test_build_instagram_embed_includes_details_when_enabled(self):
+        result = DownloadResult(
+            success=True,
+            title="Fallback title",
+            metadata={
+                "title": "Post title",
+                "uploader": "testuser",
+                "uploader_id": "testuser",
+                "upload_date": "20260529",
+                "duration": 95,
+                "width": 1080,
+                "height": 1920,
+            },
+        )
+
+        embed = build_instagram_embed(
+            result,
+            "https://www.instagram.com/reel/abc123/",
+            include_details=True,
+        )
+        fields = {field.name: field.value for field in embed.fields}
+
         self.assertIn("Creator: testuser", fields["Details"])
         self.assertIn("Posted: 2026-05-29", fields["Details"])
         self.assertIn("Duration: 1:35", fields["Details"])

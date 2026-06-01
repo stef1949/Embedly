@@ -29,6 +29,7 @@ This Discord bot looks for Twitter/X links in messages and automatically replace
    * `/status` - View detailed bot status information
    * `/help` - Show help information about available commands
    * `/emulate` - Set whether the bot should post as you or as itself
+   * `/media_details` - Set whether your media embeds include extra details
 * **Admin Commands:**
    * `/ban` - Ban a user from using the bot
    * `/unban` - Unban a previously banned user
@@ -134,7 +135,8 @@ The bot supports these environment variables (with defaults):
 When you share a TikTok link in a channel where the bot is active:
 * The bot automatically downloads the video using yt-dlp
 * The video is uploaded directly to Discord (if under 8MB file size limit)
-* The Discord embed includes available TikTok metadata such as likes, comments/messages, views, creator, posted date, duration, size, caption, and thumbnail
+* The Discord embed includes available TikTok engagement metadata such as likes, comments/messages, and views
+* You can enable the optional details section with `/media_details enable:true` to include creator, posted date, duration, and size
 * The original message is deleted and replaced with the downloaded video
 * The bot attributes the video to you with a mention
 
@@ -144,7 +146,8 @@ When you share a TikTok link in a channel where the bot is active:
 When you share an Instagram link (posts, reels, IGTV) in a channel where the bot is active:
 * The bot automatically downloads the video using yt-dlp
 * The video is uploaded directly to Discord (if under 8MB file size limit)
-* The Discord embed includes available Instagram metadata such as likes, comments/messages, views, creator, posted date, duration, size, caption, and thumbnail
+* The Discord embed includes available Instagram engagement metadata such as likes, comments/messages, and views
+* You can enable the optional details section with `/media_details enable:true` to include creator, posted date, duration, and size
 * The original message is deleted and replaced with the downloaded video
 * The bot attributes the video to you with a mention
 
@@ -160,7 +163,8 @@ When you share an Instagram link (posts, reels, IGTV) in a channel where the bot
 When you share a YouTube link in a channel where the bot is active:
 * The bot automatically downloads the video using yt-dlp
 * The video is uploaded directly to Discord (if under 8MB file size limit)
-* The Discord embed includes available YouTube metadata such as likes, comments/messages, views, creator, posted date, duration, size, description, and thumbnail
+* The Discord embed includes available YouTube engagement metadata such as likes, comments/messages, and views
+* You can enable the optional details section with `/media_details enable:true` to include creator, posted date, duration, and size
 * The original message is deleted and replaced with the downloaded video
 * The bot attributes the video to you with a mention
 

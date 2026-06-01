@@ -71,6 +71,7 @@ runtime_state = RuntimeState()
 # User preferences for emulation (True = emulate user, False = post as bot)
 user_emulation_preferences = {}  # Maps user ID to boolean preference
 DEFAULT_EMULATION = CONFIG.default_emulation  # Default to emulating users
+user_media_details_preferences = {}  # Maps user ID to boolean preference
 
 # Bot statistics
 bot_start_time = time.time()
@@ -575,7 +576,8 @@ async def help_command(interaction: discord.Interaction):
         "**Commands:**\n"
         "`/status` - Check bot status and statistics.\n"
         "`/help` - Show this help message.\n"
-        "`/emulate` - Choose whether the bot posts links as you or as itself.\n\n"
+        "`/emulate` - Choose whether the bot posts links as you or as itself.\n"
+        "`/media_details` - Choose whether your media embeds include extra details.\n\n"
         "**Post Controls:**\n"
         "When you share a Twitter/X link, it will be automatically converted, and you'll see:\n"
         "- A `Delete` button - Remove your posted link\n"
@@ -624,6 +626,26 @@ async def emulate(interaction: discord.Interaction, enable: bool):
         await interaction.followup.send(message, ephemeral=True)
     except Exception as e:
         logger.error(f"Error responding to emulate command: {e}")
+
+# Slash command: /media_details
+@tree.command(name="media_details", description="Choose whether your media embeds include extra details")
+async def media_details(interaction: discord.Interaction, enable: bool):
+    """Set whether TikTok, Instagram, and YouTube embeds for this user include optional details."""
+    logger.info(f"Received /media_details command from {interaction.user} with value {enable}")
+
+    await interaction.response.defer(ephemeral=True)
+
+    user_media_details_preferences[interaction.user.id] = enable
+
+    if enable:
+        message = "Your future media embeds will include creator, posted date, duration, and size details when available."
+    else:
+        message = "Your future media embeds will only include compact engagement metadata."
+
+    try:
+        await interaction.followup.send(message, ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error responding to media_details command: {e}")
 
 # Admin only commands
 @tree.command(name="listadmins", description="List all bot administrators")
@@ -1008,6 +1030,8 @@ async def on_message(message):
         logger.info(f"Ignoring message from blacklisted server {message.guild.id}")
         return
         
+    include_media_details = user_media_details_preferences.get(message.author.id, False)
+
     # Check server-specific settings
     if message.guild:
         # Check if the bot is enabled for this server
@@ -1021,7 +1045,7 @@ async def on_message(message):
             if message.channel.id not in whitelisted_channels:
                 logger.info(f"Ignoring message in non-whitelisted channel {message.channel.id}")
                 return
-    
+
     # Check global rate limit
     if not check_global_rate_limit():
         logger.warning("Global rate limit exceeded, ignoring message")
@@ -1064,7 +1088,7 @@ async def on_message(message):
             compressor=compress_video_to_limit_safe,
             semaphore=media_semaphore,
             config=media_config,
-            embed_factory=build_tiktok_embed,
+            embed_factory=lambda result, url: build_tiktok_embed(result, url, include_details=include_media_details),
         )
 
     # Process Instagram links
@@ -1086,7 +1110,7 @@ async def on_message(message):
             compressor=compress_video_to_limit_safe,
             semaphore=media_semaphore,
             config=media_config,
-            embed_factory=build_instagram_embed,
+            embed_factory=lambda result, url: build_instagram_embed(result, url, include_details=include_media_details),
         )
 
     # Process YouTube links
@@ -1108,7 +1132,7 @@ async def on_message(message):
             compressor=compress_video_to_limit_safe,
             semaphore=media_semaphore,
             config=media_config,
-            embed_factory=build_youtube_embed,
+            embed_factory=lambda result, url: build_youtube_embed(result, url, include_details=include_media_details),
         )
 
 # Run the bot

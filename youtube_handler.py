@@ -10,10 +10,11 @@ def download_youtube_video(video_url: str, output_folder: str | None = None) -> 
     return download_video(video_url, output_folder=output_folder)
 
 
-def build_youtube_embed(result: DownloadResult, original_url: str) -> discord.Embed:
+def build_youtube_embed(result: DownloadResult, original_url: str, *, include_details: bool = False) -> discord.Embed:
     return build_media_metadata_embed(
         result,
         original_url,
         platform_name="YouTube",
         color=YOUTUBE_COLOR,
+        include_details=include_details,
     )

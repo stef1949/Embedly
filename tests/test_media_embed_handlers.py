@@ -28,9 +28,12 @@ class MediaEmbedHandlerTests(unittest.TestCase):
 
         self.assertEqual(embed.title, "TikTok title")
         self.assertEqual(embed.description, "TikTok caption")
-        self.assertIn("Likes: 1,234", fields["Engagement"])
-        self.assertIn("Comments: 56", fields["Engagement"])
-        self.assertIn("Reposts: 7", fields["Engagement"])
+        self.assertEqual(fields["Engagement"], "❤️ Likes: 1,234 | 💬 Comments: 56 | 🔁 Reposts: 7")
+        self.assertNotIn("\n", fields["Engagement"])
+        self.assertNotIn("Details", fields)
+
+        embed = build_tiktok_embed(result, "https://www.tiktok.com/@user/video/123", include_details=True)
+        fields = {field.name: field.value for field in embed.fields}
         self.assertIn("Creator: user", fields["Details"])
         self.assertIn("Posted: 2026-05-29", fields["Details"])
         self.assertIn("Duration: 0:12", fields["Details"])
@@ -59,9 +62,12 @@ class MediaEmbedHandlerTests(unittest.TestCase):
         self.assertEqual(embed.title, "YouTube title")
         self.assertEqual(embed.description, "YouTube description")
         self.assertEqual(embed.thumbnail.url, "https://example.com/thumb.jpg")
-        self.assertIn("Likes: 9,876", fields["Engagement"])
-        self.assertIn("Comments: 54", fields["Engagement"])
-        self.assertIn("Views: 321,000", fields["Engagement"])
+        self.assertEqual(fields["Engagement"], "❤️ Likes: 9,876 | 💬 Comments: 54 | 👁️ Views: 321,000")
+        self.assertNotIn("\n", fields["Engagement"])
+        self.assertNotIn("Details", fields)
+
+        embed = build_youtube_embed(result, "https://www.youtube.com/watch?v=abc123", include_details=True)
+        fields = {field.name: field.value for field in embed.fields}
         self.assertIn("Creator: Channel Name", fields["Details"])
         self.assertIn("Posted: 2026-05-29", fields["Details"])
         self.assertIn("Duration: 1:01:01", fields["Details"])

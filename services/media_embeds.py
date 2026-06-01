@@ -12,13 +12,13 @@ MAX_EMBED_DESCRIPTION_LENGTH = 3000
 MAX_EMBED_FIELD_LENGTH = 1024
 
 DEFAULT_ENGAGEMENT_STATS = (
-    ("Likes", ("like_count",)),
-    ("Comments", ("comment_count", "comments_count")),
-    ("Messages", ("message_count",)),
-    ("Views", ("view_count",)),
-    ("Shares", ("share_count",)),
-    ("Reposts", ("repost_count",)),
-    ("Favorites", ("favorite_count",)),
+    ("Likes", "❤️", ("like_count",)),
+    ("Comments", "💬", ("comment_count", "comments_count")),
+    ("Messages", "✉️", ("message_count",)),
+    ("Views", "👁️", ("view_count",)),
+    ("Shares", "🔗", ("share_count",)),
+    ("Reposts", "🔁", ("repost_count",)),
+    ("Favorites", "⭐", ("favorite_count",)),
 )
 
 
@@ -28,6 +28,7 @@ def build_media_metadata_embed(
     *,
     platform_name: str,
     color: int,
+    include_details: bool = False,
 ) -> discord.Embed:
     metadata = result.metadata or {}
     embed_url = _first_text(metadata, ("webpage_url", "original_url", "url")) or original_url
@@ -43,9 +44,10 @@ def build_media_metadata_embed(
     if engagement:
         embed.add_field(name="Engagement", value=engagement, inline=False)
 
-    details = _format_details(metadata)
-    if details:
-        embed.add_field(name="Details", value=details, inline=False)
+    if include_details:
+        details = _format_details(metadata)
+        if details:
+            embed.add_field(name="Details", value=details, inline=False)
 
     thumbnail_url = _first_text(metadata, ("thumbnail",))
     if thumbnail_url and thumbnail_url.startswith(("http://", "https://")):
@@ -55,12 +57,12 @@ def build_media_metadata_embed(
 
 
 def _format_engagement(metadata: dict[str, Any]) -> str:
-    lines = []
-    for label, keys in DEFAULT_ENGAGEMENT_STATS:
+    items = []
+    for label, icon, keys in DEFAULT_ENGAGEMENT_STATS:
         value = _first_number(metadata, keys)
         if value is not None:
-            lines.append(f"{label}: {_format_count(value)}")
-    return _truncate("\n".join(lines), MAX_EMBED_FIELD_LENGTH)
+            items.append(f"{icon} {label}: {_format_count(value)}")
+    return _truncate(" | ".join(items), MAX_EMBED_FIELD_LENGTH)
 
 
 def _format_details(metadata: dict[str, Any]) -> str:
