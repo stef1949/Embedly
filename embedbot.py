@@ -8,7 +8,7 @@ import asyncio
 import subprocess
 from typing import Callable
 from tiktok_handler import build_tiktok_embed, download_tiktok_video
-from instagram_handler import build_instagram_embed, download_instagram_video
+from instagram_handler import build_instagram_embed, download_instagram_media
 from youtube_handler import build_youtube_embed, download_youtube_video
 from config import load_config
 from utils.urls import (
@@ -1105,11 +1105,12 @@ async def on_message(message):
             source_name="Instagram",
             icon="📸",
             url_validator=validate_instagram_url_safe,
-            downloader=download_instagram_video,
+            downloader=download_instagram_media,
             view_factory=lambda url: InstagramControlView(original_url=url, timeout=604800),
             compressor=compress_video_to_limit_safe,
             semaphore=media_semaphore,
             config=media_config,
+            default_media_label="media",
             embed_factory=lambda result, url: build_instagram_embed(result, url, include_details=include_media_details),
         )
 

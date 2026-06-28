@@ -55,6 +55,12 @@ async def run_blocking(func: Callable, *args, timeout_seconds: int | None = None
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+def media_label(result: DownloadResult, default: str) -> str:
+    if result.media_type in {"image", "video"}:
+        return result.media_type
+    return default
+
+
 async def process_media_links(
     *,
     message: discord.Message,
@@ -68,11 +74,14 @@ async def process_media_links(
     semaphore: asyncio.Semaphore,
     config: MediaProcessingConfig,
     embed_factory: Callable[[DownloadResult, str], discord.Embed] | None = None,
+    default_media_label: str = "video",
 ) -> int:
     processed = 0
     for source_url in urls:
         validated_url = url_validator(source_url)
-        processing_msg = await message.channel.send(f"⏳ Downloading {source_name} video from <@{message.author.id}>...")
+        processing_msg = await message.channel.send(
+            f"⏳ Downloading {source_name} {default_media_label} from <@{message.author.id}>..."
+        )
 
         filepath: str | None = None
         original_filepath: str | None = None
@@ -92,8 +101,17 @@ async def process_media_links(
 
             original_filepath = result.filepath
             filepath = result.filepath
+            label = media_label(result, default_media_label)
 
             if os.path.getsize(filepath) > config.upload_limit_bytes:
+                if result.media_type == "image":
+                    logger.warning(
+                        "%s image exceeds upload limit and cannot be video-compressed: %s",
+                        source_name,
+                        filepath,
+                    )
+                    continue
+
                 compressed_path = await run_blocking(
                     compressor,
                     filepath,
@@ -110,7 +128,7 @@ async def process_media_links(
                 filepath = compressed_path
 
                 if os.path.getsize(filepath) > config.upload_limit_bytes:
-                    logger.warning("Compressed %s video still exceeds upload limit: %s", source_name, filepath)
+                    logger.warning("Compressed %s %s still exceeds upload limit: %s", source_name, label, filepath)
                     continue
 
             media_view = view_factory(validated_url)
@@ -119,7 +137,7 @@ async def process_media_links(
             with open(filepath, "rb") as media_file:
                 file = discord.File(media_file, filename=os.path.basename(filepath))
                 await delete_message_silently(processing_msg)
-                content = f"{icon} **{source_name} video shared by <@{message.author.id}>:**"
+                content = f"{icon} **{source_name} {label} shared by <@{message.author.id}>:**"
                 if embed is None:
                     content = f"{content}\n{result.title}"
                 send_kwargs = {
@@ -137,7 +155,7 @@ async def process_media_links(
         except asyncio.TimeoutError:
             logger.error("%s operation timed out for URL: %s", source_name, validated_url)
         except (discord.HTTPException, discord.Forbidden, OSError, IOError) as exc:
-            logger.error("Error processing %s video %s: %s", source_name, validated_url, exc)
+            logger.error("Error processing %s media %s: %s", source_name, validated_url, exc)
         finally:
             await delete_message_silently(processing_msg)
             if filepath:
