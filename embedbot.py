@@ -957,25 +957,31 @@ async def on_ready():
         fetch_user=client.fetch_user,
     )
     register_persistent_views()
-    cuda_visible = os.getenv("CUDA_VISIBLE_DEVICES")
-    nvidia_visible = os.getenv("NVIDIA_VISIBLE_DEVICES")
-    logger.info(f"CUDA_VISIBLE_DEVICES={cuda_visible if cuda_visible is not None else 'unset'}")
-    logger.info(f"NVIDIA_VISIBLE_DEVICES={nvidia_visible if nvidia_visible is not None else 'unset'}")
-    if os.name != "nt":
-        nvidia_nodes = [p for p in ("/dev/nvidia0", "/dev/nvidiactl", "/dev/nvidia-uvm") if os.path.exists(p)]
-        logger.info(f"NVIDIA device nodes present: {', '.join(nvidia_nodes) if nvidia_nodes else 'none'}")
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "-L"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        logger.info(f"nvidia-smi -L output:\n{result.stdout.strip()}")
-        if result.stderr.strip():
-            logger.warning(f"nvidia-smi -L stderr:\n{result.stderr.strip()}")
-    except Exception as e:
-        logger.warning(f"nvidia-smi -L failed: {e}")
+    if CONFIG.use_nvidia_gpu:
+        cuda_visible = os.getenv("CUDA_VISIBLE_DEVICES")
+        nvidia_visible = os.getenv("NVIDIA_VISIBLE_DEVICES")
+        logger.info(f"CUDA_VISIBLE_DEVICES={cuda_visible if cuda_visible is not None else 'unset'}")
+        logger.info(f"NVIDIA_VISIBLE_DEVICES={nvidia_visible if nvidia_visible is not None else 'unset'}")
+        if os.name != "nt":
+            nvidia_nodes = [p for p in ("/dev/nvidia0", "/dev/nvidiactl", "/dev/nvidia-uvm") if os.path.exists(p)]
+            logger.info(f"NVIDIA device nodes present: {', '.join(nvidia_nodes) if nvidia_nodes else 'none'}")
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "-L"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            logger.info(f"nvidia-smi -L output:\n{result.stdout.strip()}")
+            if result.stderr.strip():
+                logger.warning(f"nvidia-smi -L stderr:\n{result.stderr.strip()}")
+        except FileNotFoundError:
+            logger.warning("USE_NVIDIA_GPU is enabled, but nvidia-smi was not found in PATH")
+        except subprocess.CalledProcessError as e:
+            detail = e.stderr.strip() if e.stderr else str(e)
+            logger.warning(f"USE_NVIDIA_GPU is enabled, but nvidia-smi -L failed: {detail}")
+        except Exception as e:
+            logger.warning(f"USE_NVIDIA_GPU is enabled, but nvidia-smi -L failed: {e}")
     
     # Initialize admins (bot owner or team members)
     try:
