@@ -95,6 +95,15 @@ def validate_tiktok_url(url: str) -> str:
     return clean
 
 
+def rewrite_tiktok_url(url: str) -> str:
+    """Return a sanitized TikTok URL using kktiktok.com as the embed host."""
+    clean = validate_tiktok_url(url)
+    parsed = urlsplit(clean)
+    if _normalize_host(parsed.hostname) not in TIKTOK_HOSTS:
+        return clean
+    return urlunsplit((parsed.scheme, "kktiktok.com", parsed.path, parsed.query, ""))
+
+
 def validate_instagram_url(url: str) -> str:
     clean = _strip_trailing_punctuation(sanitize_url(url))
     parsed = urlsplit(clean)

@@ -26,6 +26,7 @@ from views import (
     configure_view_context,
 )
 from handlers.media import MediaProcessingConfig, process_media_links as process_media_links_shared
+from handlers.tiktok import try_kktiktok_embed
 from handlers.twitter import send_twitter_rewrite_message
 from runtime_state import RuntimeState
 
@@ -1083,19 +1084,36 @@ async def on_message(message):
             return
         tiktok_urls = [match.group(0) for match in tiktok_matches]
         logger.info(f"Processing TikTok links from {message.author} (ID: {message.id}) with URLs: {tiktok_urls}")
-        links_processed += await process_media_links_shared(
-            message=message,
-            urls=tiktok_urls,
-            source_name="TikTok",
-            icon="🎵",
-            url_validator=validate_tiktok_url_safe,
-            downloader=download_tiktok_video,
-            view_factory=lambda url: TikTokControlView(original_url=url, timeout=604800),
-            compressor=compress_video_to_limit_safe,
-            semaphore=media_semaphore,
-            config=media_config,
-            embed_factory=lambda result, url: build_tiktok_embed(result, url, include_details=include_media_details),
-        )
+        fallback_urls = []
+        kktiktok_processed = 0
+        for url in tiktok_urls:
+            if await try_kktiktok_embed(
+                message=message,
+                source_url=url,
+                view_factory=lambda original_url: TikTokControlView(original_url=original_url, timeout=604800),
+            ):
+                kktiktok_processed += 1
+            else:
+                fallback_urls.append(url)
+
+        if kktiktok_processed:
+            links_processed += kktiktok_processed
+            await maybe_delete_original_message(message, "TikTok")
+
+        if fallback_urls:
+            links_processed += await process_media_links_shared(
+                message=message,
+                urls=fallback_urls,
+                source_name="TikTok",
+                icon="🎵",
+                url_validator=validate_tiktok_url_safe,
+                downloader=download_tiktok_video,
+                view_factory=lambda url: TikTokControlView(original_url=url, timeout=604800),
+                compressor=compress_video_to_limit_safe,
+                semaphore=media_semaphore,
+                config=media_config,
+                embed_factory=lambda result, url: build_tiktok_embed(result, url, include_details=include_media_details),
+            )
 
     # Process Instagram links
     instagram_matches = list(INSTAGRAM_URL_REGEX.finditer(message.content))

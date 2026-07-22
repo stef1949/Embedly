@@ -3,6 +3,7 @@ from urllib.parse import urlparse
 
 from utils.urls import (
     rewrite_twitter_urls,
+    rewrite_tiktok_url,
     is_tiktok_url,
     is_instagram_url,
     is_youtube_url,
@@ -41,6 +42,16 @@ class UrlTests(unittest.TestCase):
         self.assertEqual(validate_tiktok_url("https://www.tiktok.com/@user/video/1!!!"), "https://www.tiktok.com/@user/video/1")
         self.assertEqual(validate_instagram_url("https://www.instagram.com/reel/abc123),"), "https://www.instagram.com/reel/abc123")
         self.assertEqual(validate_youtube_url("https://youtu.be/abc123),"), "https://youtu.be/abc123")
+
+    def test_rewrite_tiktok_url_uses_kktiktok_host(self):
+        self.assertEqual(
+            rewrite_tiktok_url("https://www.tiktok.com/@user/video/123?lang=en"),
+            "https://kktiktok.com/@user/video/123?lang=en",
+        )
+        self.assertEqual(
+            rewrite_tiktok_url("https://vm.tiktok.com/ZM123456/"),
+            "https://kktiktok.com/ZM123456/",
+        )
 
 
 if __name__ == "__main__":
