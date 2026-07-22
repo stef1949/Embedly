@@ -28,8 +28,8 @@ class MediaEmbedHandlerTests(unittest.TestCase):
 
         self.assertEqual(embed.title, "TikTok title")
         self.assertEqual(embed.description, "TikTok caption")
-        self.assertEqual(fields["Engagement"], "❤️ Likes: 1,234 | 💬 Comments: 56 | 🔁 Reposts: 7")
-        self.assertNotIn("\n", fields["Engagement"])
+        self.assertEqual(fields["Post info"], "❤️ **1,234**  💬 **56**  🔁 **7**")
+        self.assertNotIn("\n", fields["Post info"])
         self.assertNotIn("Details", fields)
 
         embed = build_tiktok_embed(result, "https://www.tiktok.com/@user/video/123", include_details=True)

@@ -96,12 +96,12 @@ def validate_tiktok_url(url: str) -> str:
 
 
 def rewrite_tiktok_url(url: str) -> str:
-    """Return a sanitized TikTok URL using kktiktok.com as the embed host."""
+    """Return a sanitized TikTok URL using tnktok.com as the embed host."""
     clean = validate_tiktok_url(url)
     parsed = urlsplit(clean)
     if _normalize_host(parsed.hostname) not in TIKTOK_HOSTS:
         return clean
-    return urlunsplit((parsed.scheme, "kktiktok.com", parsed.path, parsed.query, ""))
+    return urlunsplit((parsed.scheme, "tnktok.com", parsed.path, parsed.query, ""))
 
 
 def validate_instagram_url(url: str) -> str:

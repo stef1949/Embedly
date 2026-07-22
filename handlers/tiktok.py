@@ -18,7 +18,7 @@ async def try_kktiktok_embed(
     view_factory: Callable[[str], discord.ui.View],
     embed_wait_seconds: float = 3.0,
 ) -> bool:
-    """Post a kktiktok link and return whether Discord rendered an embed for it."""
+    """Post a fixed TikTok link and return whether Discord rendered an embed for it."""
     rewritten_url = rewrite_tiktok_url(source_url)
     view = view_factory(source_url)
     view.original_author_id = message.author.id
@@ -40,14 +40,14 @@ async def try_kktiktok_embed(
             logger.debug("Could not refresh kktiktok message %s: %s", sent_message.id, exc)
 
         if rendered_message.embeds:
-            logger.info("kktiktok embed rendered for %s", source_url)
+            logger.info("TikTok embed rendered for %s", source_url)
             return True
 
-        logger.warning("kktiktok did not render an embed for %s; using download fallback", source_url)
+        logger.warning("TikTok embed did not render for %s; using download fallback", source_url)
         await _delete_silently(sent_message)
         return False
     except (discord.Forbidden, discord.HTTPException) as exc:
-        logger.warning("Could not send kktiktok link for %s; using download fallback: %s", source_url, exc)
+        logger.warning("Could not send TikTok embed link for %s; using download fallback: %s", source_url, exc)
         return False
 
 

@@ -29,6 +29,11 @@ def build_media_metadata_embed(
     platform_name: str,
     color: int,
     include_details: bool = False,
+    engagement_field_name: str = "Engagement",
+    engagement_show_labels: bool = True,
+    engagement_bold_counts: bool = False,
+    engagement_separator: str = " | ",
+    engagement_stats: Iterable[tuple[str, str, tuple[str, ...]]] = DEFAULT_ENGAGEMENT_STATS,
 ) -> discord.Embed:
     metadata = result.metadata or {}
     embed_url = _first_text(metadata, ("webpage_url", "original_url", "url")) or original_url
@@ -40,9 +45,15 @@ def build_media_metadata_embed(
     if description and description != raw_title:
         embed.description = _truncate(description, MAX_EMBED_DESCRIPTION_LENGTH)
 
-    engagement = _format_engagement(metadata)
+    engagement = _format_engagement(
+        metadata,
+        stats=engagement_stats,
+        show_labels=engagement_show_labels,
+        bold_counts=engagement_bold_counts,
+        separator=engagement_separator,
+    )
     if engagement:
-        embed.add_field(name="Engagement", value=engagement, inline=False)
+        embed.add_field(name=engagement_field_name, value=engagement, inline=False)
 
     if include_details:
         details = _format_details(metadata)
@@ -56,13 +67,23 @@ def build_media_metadata_embed(
     return embed
 
 
-def _format_engagement(metadata: dict[str, Any]) -> str:
+def _format_engagement(
+    metadata: dict[str, Any],
+    *,
+    stats: Iterable[tuple[str, str, tuple[str, ...]]] = DEFAULT_ENGAGEMENT_STATS,
+    show_labels: bool = True,
+    bold_counts: bool = False,
+    separator: str = " | ",
+) -> str:
     items = []
-    for label, icon, keys in DEFAULT_ENGAGEMENT_STATS:
+    for label, icon, keys in stats:
         value = _first_number(metadata, keys)
         if value is not None:
-            items.append(f"{icon} {label}: {_format_count(value)}")
-    return _truncate(" | ".join(items), MAX_EMBED_FIELD_LENGTH)
+            count = _format_count(value)
+            if bold_counts:
+                count = f"**{count}**"
+            items.append(f"{icon} {label}: {count}" if show_labels else f"{icon} {count}")
+    return _truncate(separator.join(items), MAX_EMBED_FIELD_LENGTH)
 
 
 def _format_details(metadata: dict[str, Any]) -> str:

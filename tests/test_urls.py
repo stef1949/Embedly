@@ -43,14 +43,14 @@ class UrlTests(unittest.TestCase):
         self.assertEqual(validate_instagram_url("https://www.instagram.com/reel/abc123),"), "https://www.instagram.com/reel/abc123")
         self.assertEqual(validate_youtube_url("https://youtu.be/abc123),"), "https://youtu.be/abc123")
 
-    def test_rewrite_tiktok_url_uses_kktiktok_host(self):
+    def test_rewrite_tiktok_url_uses_tnktok_host(self):
         self.assertEqual(
             rewrite_tiktok_url("https://www.tiktok.com/@user/video/123?lang=en"),
-            "https://kktiktok.com/@user/video/123?lang=en",
+            "https://tnktok.com/@user/video/123?lang=en",
         )
         self.assertEqual(
             rewrite_tiktok_url("https://vm.tiktok.com/ZM123456/"),
-            "https://kktiktok.com/ZM123456/",
+            "https://tnktok.com/ZM123456/",
         )
 
 

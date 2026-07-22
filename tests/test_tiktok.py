@@ -41,7 +41,7 @@ class TikTokEmbedTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(succeeded)
-        self.assertIn("https://kktiktok.com/@user/video/123", message.channel.sent[0][0]["content"])
+        self.assertIn("https://tnktok.com/@user/video/123", message.channel.sent[0][0]["content"])
         self.assertEqual(view.original_author_id, 456)
         self.assertFalse(message.channel.sent[0][1].deleted)
 

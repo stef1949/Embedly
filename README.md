@@ -6,7 +6,7 @@ This Discord bot looks for Twitter/X links in messages and automatically replace
 
 ### Core Functionality
 * **URL Replacement:** Finds URLs containing `twitter.com` or `x.com` and replaces them with `vxtwitter.com`
-* **TikTok Embeds:** Rewrites TikTok links to `kktiktok.com`, with automatic download and upload fallback when Discord cannot render the embed
+* **TikTok Embeds:** Rewrites TikTok links to `tnktok.com` for playable embeds with post stats, with automatic download and upload fallback when Discord cannot render the embed
 * **Instagram Media Downloads:** Automatically downloads and shares Instagram images, videos, and reels with available engagement metadata when Instagram links are posted
 * **YouTube Video Downloads:** Automatically downloads and shares YouTube videos/shorts with available engagement metadata when YouTube links are posted
 * **User Emulation:** Can post links either as the original user (with their name and avatar) or as the bot with attribution
@@ -134,10 +134,10 @@ The bot supports these environment variables (with defaults):
 ### TikTok Embeds
 When you share a TikTok link in a channel where the bot is active:
 
-* The bot first rewrites the link to `kktiktok.com` for a native Discord embed
+* The bot first rewrites the link to `tnktok.com` for a playable Discord embed with likes, comments, and reposts
 * If Discord does not render that embed, the bot falls back to downloading and sharing the video directly
 * The fallback uses yt-dlp and uploads the video directly when it fits Discord's file size limit
-* Fallback uploads include available TikTok engagement metadata such as likes, comments/messages, and views
+* Fallback uploads show compact post info such as `❤️ **871**  💬 **4**  🔁 **187**`
 * You can enable the optional details section with `/media_details enable:true` to include creator, posted date, duration, and size
 * The original message is deleted and replaced with the downloaded video
 * The bot attributes the video to you with a mention

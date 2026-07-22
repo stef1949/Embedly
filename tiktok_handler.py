@@ -4,6 +4,11 @@ from services.downloaders import DownloadResult, download_video
 from services.media_embeds import build_media_metadata_embed
 
 TIKTOK_COLOR = 0x25F4EE
+TIKTOK_POST_STATS = (
+    ("Likes", "❤️", ("like_count",)),
+    ("Comments", "💬", ("comment_count", "comments_count")),
+    ("Reposts", "🔁", ("repost_count", "share_count")),
+)
 
 
 def download_tiktok_video(video_url: str, output_folder: str | None = None) -> DownloadResult:
@@ -17,4 +22,9 @@ def build_tiktok_embed(result: DownloadResult, original_url: str, *, include_det
         platform_name="TikTok",
         color=TIKTOK_COLOR,
         include_details=include_details,
+        engagement_field_name="Post info",
+        engagement_show_labels=False,
+        engagement_bold_counts=True,
+        engagement_separator="  ",
+        engagement_stats=TIKTOK_POST_STATS,
     )
