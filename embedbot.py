@@ -1,38 +1,48 @@
-import logging
-import discord
-import re
-import os
-import time
-import sys
 import asyncio
+import logging
+import os
+import re
 import subprocess
-from typing import Callable
-from tiktok_handler import build_tiktok_embed, download_tiktok_video
-from instagram_handler import build_instagram_embed, download_instagram_media
-from youtube_handler import build_youtube_embed, download_youtube_video
+import sys
+import time
+
+import discord
+
 from config import load_config
+from handlers.media import (
+    MediaProcessingConfig,
+    maybe_delete_original_message,
+    process_media_links as process_media_links_shared,
+)
+from handlers.tiktok import process_tiktok_links
+from handlers.twitter import send_twitter_rewrite_message
+from instagram_handler import build_instagram_embed, download_instagram_media
+from persistence import SQLiteStateStore
+from runtime_state import RuntimeState
+from services.transcode import compress_video_to_limit as compress_video_to_limit_safe
+from tiktok_handler import download_tiktok_video, resolve_tiktok_icon
 from utils.urls import (
     rewrite_twitter_urls,
     validate_instagram_url as validate_instagram_url_safe,
     validate_tiktok_url as validate_tiktok_url_safe,
     validate_youtube_url as validate_youtube_url_safe,
 )
-from services.transcode import compress_video_to_limit as compress_video_to_limit_safe
 from views import (
     InstagramControlView,
     MessageControlView,
+    TikTokCardView,
     TikTokControlView,
     YouTubeControlView,
     configure_view_context,
 )
-from handlers.media import MediaProcessingConfig, process_media_links as process_media_links_shared
-from handlers.tiktok import try_kktiktok_embed
-from handlers.twitter import send_twitter_rewrite_message
-from runtime_state import RuntimeState
+from youtube_handler import build_youtube_embed, download_youtube_video
+
+CONFIG = load_config()
+TOKEN = CONFIG.discord_token
 
 # Configure logging to show the time, logger name, level, and message.
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, CONFIG.log_level, logging.INFO),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler("bot.log"),
@@ -40,9 +50,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-CONFIG = load_config()
-TOKEN = CONFIG.discord_token
 
 # Enable the message content intent (required to read messages)
 intents = discord.Intents.default()
@@ -68,6 +75,8 @@ YOUTUBE_URL_REGEX = re.compile(
 # Rate limiting configuration (per user)
 RATE_LIMIT_SECONDS = CONFIG.rate_limit_seconds
 runtime_state = RuntimeState()
+state = SQLiteStateStore(CONFIG.state_database_path)
+TIKTOK_ICON = resolve_tiktok_icon(CONFIG.tiktok_emoji)
 
 # User preferences for emulation (True = emulate user, False = post as bot)
 user_emulation_preferences = {}  # Maps user ID to boolean preference
@@ -117,12 +126,7 @@ def is_user_banned(user_id):
 
 def is_admin(user_id):
     """Check if a user is a bot admin"""
-    # First check if the user is in the admin set
-    if user_id in ADMIN_IDS:
-        return True
-    
-    # Return a default value - will be updated on the next is_admin check
-    return False
+    return user_id in ADMIN_IDS
 
 async def refresh_admin_status():
     """Refresh the admin status from application info"""
@@ -141,24 +145,6 @@ async def refresh_admin_status():
     except Exception as e:
         logger.error(f"Failed to refresh admin status: {e}")
 
-async def check_team_membership(user_id):
-    """Check if a user is a member of the bot's team"""
-    try:
-        application = await client.application_info()
-        
-        # Check if the bot is owned by a team
-        if application.team:
-            for team_member in application.team.members:
-                if team_member.id == user_id:
-                    logger.info(f"User {user_id} is a member of team {application.team.name}")
-                    return True
-        
-        # If not a team bot or user not in team
-        return False
-    except Exception as e:
-        logger.error(f"Failed to check team membership: {e}")
-        return False
-
 def is_server_blacklisted(server_id):
     """Check if a server is blacklisted"""
     return server_id in SERVER_BLACKLIST
@@ -174,293 +160,6 @@ def set_server_setting(server_id, key, value):
     if server_id not in server_settings:
         server_settings[server_id] = {}
     server_settings[server_id][key] = value
-
-def sanitize_url(url):
-    """Sanitize a URL to prevent potential injection attacks"""
-    # For Twitter/X URLs, use basic sanitization
-    # Note: # (fragment identifier) is excluded for security
-    return re.sub(r'[^\w\.\/\:\-\?\&\=\%]', '', url)
-
-def validate_tiktok_url(url):
-    """
-    Validate and sanitize a TikTok URL.
-    Returns the validated/sanitized URL. Logs a warning if URL doesn't match expected patterns.
-    """
-    # TikTok URL patterns we expect (checked with re.IGNORECASE)
-    case_insensitive_patterns = [
-        r'^https?://(?:www\.)?tiktok\.com/@[\w\.]+/video/\d+',
-        r'^https?://(?:www\.)?tiktok\.com/t/[\w]+',
-        r'^https?://vm\.tiktok\.com/[\w]+',
-    ]
-    
-    # Short URL pattern (case-sensitive path check to avoid matching common lowercase paths)
-    # TikTok short URLs are 8-12 characters total and start with uppercase letter or digit (e.g., ZNRrFcTFL)
-    # Pattern breakdown: [A-Z0-9] (1 char) + [A-Za-z0-9]{7,11} (7-11 chars) = 8-12 chars total
-    # This excludes common paths like "trending", "foryou", "following" which are all lowercase
-    # If a capitalized common path is matched (e.g., "Trending"), yt-dlp will handle it gracefully
-    short_url_pattern = r'^https?://(?:www\.)?tiktok\.com/[A-Z0-9][A-Za-z0-9]{7,11}/?$'
-    
-    # Check if URL matches any valid pattern
-    matched = False
-    for pattern in case_insensitive_patterns:
-        if re.match(pattern, url, re.IGNORECASE):
-            matched = True
-            break
-    
-    # Check short URL pattern without IGNORECASE for the path part
-    if not matched and re.match(short_url_pattern, url):
-        matched = True
-    
-    if not matched:
-        logger.warning(f"TikTok URL doesn't match expected patterns: {url}")
-    
-    # Basic sanitization - remove any trailing fragments or suspicious characters
-    # Keep only the base URL components, including @ symbol for TikTok usernames
-    return re.sub(r'[^\w\.\/\:\-\?\&\=\%\@]', '', url)
-
-def validate_instagram_url(url):
-    """
-    Validate and sanitize an Instagram URL.
-    Returns the validated/sanitized URL. Logs a warning if URL doesn't match expected patterns.
-    """
-    # Instagram URL patterns we expect
-    patterns = [
-        r'^https?://(?:www\.)?instagram\.com/p/[\w\-]+',  # Posts
-        r'^https?://(?:www\.)?instagram\.com/reels?/[\w\-]+',  # Reels (reel or reels)
-        r'^https?://(?:www\.)?instagram\.com/tv/[\w\-]+',  # IGTV
-        r'^https?://(?:www\.)?instagram\.com/stories/[\w\.]+/\d+',  # Stories
-        r'^https?://(?:www\.)?instagr\.am/p/[\w\-]+',  # Short URL posts
-        r'^https?://(?:www\.)?instagr\.am/reels?/[\w\-]+',  # Short URL reels
-    ]
-    
-    # Check if URL matches any valid pattern
-    matched = False
-    for pattern in patterns:
-        if re.match(pattern, url, re.IGNORECASE):
-            matched = True
-            break
-    
-    if not matched:
-        logger.warning(f"Instagram URL doesn't match expected patterns: {url}")
-    
-    # Basic sanitization - remove any trailing fragments or suspicious characters
-    # Keep only the base URL components
-    return re.sub(r'[^\w\.\/\:\-\?\&\=\%]', '', url)
-
-def cleanup_file(filepath):
-    """Clean up a temporary file with proper error handling"""
-    try:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-            logger.info(f"Cleaned up temporary file: {filepath}")
-    except OSError as e:
-        logger.warning(f"Failed to clean up file {filepath}: {e}")
-
-async def run_blocking(func, *args, timeout_seconds=None, **kwargs):
-    if timeout_seconds:
-        return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=timeout_seconds)
-    return await asyncio.to_thread(func, *args, **kwargs)
-
-def get_video_duration_seconds(filepath):
-    """Return video duration in seconds using ffprobe, or None on failure"""
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                filepath,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=FFPROBE_TIMEOUT_SECONDS,
-        )
-        duration_str = result.stdout.strip()
-        if not duration_str:
-            return None
-        duration = float(duration_str)
-        if duration <= 0:
-            return None
-        return duration
-    except subprocess.TimeoutExpired as e:
-        logger.warning(f"ffprobe timed out for {filepath}: {e}")
-        return None
-    except Exception as e:
-        logger.warning(f"Failed to get video duration for {filepath}: {e}")
-        return None
-
-def compress_video_to_limit(filepath, max_size_bytes):
-    """
-    Compress a video using ffmpeg to fit within max_size_bytes.
-    Returns the compressed filepath, or None on failure.
-    """
-    duration = get_video_duration_seconds(filepath)
-    if duration is None:
-        return None
-
-    # Reserve some headroom for container overhead and Discord metadata
-    target_total_bits = int(max_size_bytes * 8 * 0.95)
-    # Use a conservative audio bitrate and allocate the rest to video
-    audio_bitrate = 96_000
-    total_bitrate = max(int(target_total_bits / duration), audio_bitrate + 50_000)
-    video_bitrate = max(total_bitrate - audio_bitrate, 300_000)
-
-    output_dir = os.path.dirname(filepath) or "."
-    base_name, _ = os.path.splitext(os.path.basename(filepath))
-    compressed_path = os.path.join(output_dir, f"{base_name}_compressed.mp4")
-
-    use_nvidia_gpu = os.getenv('USE_NVIDIA_GPU', 'false').lower() in ('true', '1', 'yes')
-    if use_nvidia_gpu and os.name != "nt":
-        if not (os.path.exists("/dev/nvidia0") or os.path.exists("/dev/nvidiactl")):
-            logger.warning("NVIDIA device nodes not found; skipping NVENC and using libx264")
-            use_nvidia_gpu = False
-
-    def run_ffmpeg(video_codec, preset, extra_args=None):
-        if extra_args is None:
-            extra_args = []
-        ffmpeg_args = [
-            "ffmpeg",
-            "-y",
-            "-i", filepath,
-            "-c:v", video_codec,
-            *extra_args,
-            "-b:v", str(video_bitrate),
-            "-maxrate", str(video_bitrate),
-            "-bufsize", str(video_bitrate * 2),
-            "-preset", preset,
-            "-c:a", "aac",
-            "-b:a", str(audio_bitrate),
-            compressed_path,
-        ]
-        return subprocess.run(
-            ffmpeg_args,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=FFMPEG_TIMEOUT_SECONDS,
-        )
-
-    try:
-        if use_nvidia_gpu:
-            try:
-                run_ffmpeg("h264_nvenc", "p4", ["-gpu", "0"])
-            except Exception as e:
-                logger.warning(f"NVENC compression failed, falling back to libx264: {e}")
-                run_ffmpeg("libx264", "veryfast")
-        else:
-            run_ffmpeg("libx264", "veryfast")
-    except subprocess.TimeoutExpired as e:
-        logger.error(f"FFmpeg compression timed out for {filepath}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"FFmpeg compression failed for {filepath}: {e}")
-        return None
-
-    if not os.path.exists(compressed_path):
-        logger.error(f"Compressed file not created: {compressed_path}")
-        return None
-
-    return compressed_path
-
-async def delete_message_silently(message):
-    """Delete a Discord message silently without raising errors"""
-    try:
-        await message.delete()
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-        logger.debug(f"Could not delete message {message.id}: {e}")
-    except Exception as e:
-        logger.warning(f"Unexpected error deleting message {message.id}: {e}")
-
-
-async def maybe_delete_original_message(message: discord.Message, context: str) -> None:
-    """Delete a source message with consistent error handling."""
-    try:
-        await message.delete()
-        logger.info(f"Deleted original {context} message {message.id} from {message.author}")
-    except discord.Forbidden:
-        logger.warning(f"Missing permissions to delete {context} message {message.id} from {message.author}")
-    except discord.HTTPException as e:
-        logger.error(f"Failed to delete {context} message {message.id}: {e}")
-
-
-async def process_media_links(
-    *,
-    message: discord.Message,
-    urls: list[str],
-    source_name: str,
-    icon: str,
-    url_validator: Callable[[str], str],
-    downloader: Callable,
-    view_factory: Callable[[str], discord.ui.View],
-) -> int:
-    """Shared media processing flow for TikTok/Instagram links."""
-    processed = 0
-    for source_url in urls:
-        validated_url = url_validator(source_url)
-        processing_msg = await message.channel.send(f"⏳ Downloading {source_name} video from <@{message.author.id}>...")
-        result = None
-        filepath = None
-        original_filepath = None
-        try:
-            async with media_semaphore:
-                result = await run_blocking(
-                    downloader,
-                    validated_url,
-                    output_folder=CONFIG.temp_directory,
-                    timeout_seconds=YTDLP_TIMEOUT_SECONDS,
-                )
-            if not result or not result.get("success"):
-                logger.error("%s download failed: %s", source_name, result.get("error", "Unknown error") if result else "Unknown error")
-                continue
-
-            original_filepath = result["filepath"]
-            filepath = original_filepath
-            file_size = os.path.getsize(filepath)
-            if file_size > UPLOAD_LIMIT_BYTES:
-                compressed_path = await run_blocking(
-                    compress_video_to_limit_safe,
-                    filepath,
-                    UPLOAD_LIMIT_BYTES,
-                    ffprobe_timeout_seconds=FFPROBE_TIMEOUT_SECONDS,
-                    ffmpeg_timeout_seconds=FFMPEG_TIMEOUT_SECONDS,
-                    headroom_ratio=CONFIG.ffmpeg_headroom_ratio,
-                    use_nvidia_gpu=CONFIG.use_nvidia_gpu,
-                    timeout_seconds=FFMPEG_TIMEOUT_SECONDS,
-                )
-                if not compressed_path:
-                    logger.warning("%s compression failed for %s", source_name, filepath)
-                    continue
-                filepath = compressed_path
-                if os.path.getsize(filepath) > UPLOAD_LIMIT_BYTES:
-                    logger.warning("Compressed %s video still exceeds upload limit: %s", source_name, filepath)
-                    continue
-
-            media_view = view_factory(validated_url)
-            media_view.original_author_id = message.author.id
-            with open(filepath, "rb") as media_file:
-                file = discord.File(media_file, filename=os.path.basename(filepath))
-                await delete_message_silently(processing_msg)
-                sent_message = await message.channel.send(
-                    content=f"{icon} **{source_name} video shared by <@{message.author.id}>:**\n{result.get('title', 'Unknown Title')}",
-                    file=file,
-                    view=media_view,
-                )
-                media_view.message = sent_message
-            processed += 1
-            await maybe_delete_original_message(message, source_name)
-        except asyncio.TimeoutError:
-            logger.error("%s operation timed out for URL: %s", source_name, validated_url)
-        except (discord.HTTPException, discord.Forbidden, OSError, IOError) as e:
-            logger.error("Error processing %s video %s: %s", source_name, validated_url, e)
-        finally:
-            await delete_message_silently(processing_msg)
-            if filepath:
-                cleanup_file(filepath)
-            if original_filepath and original_filepath != filepath:
-                cleanup_file(original_filepath)
-    return processed
 
 # Security event logging
 def log_security_event(event_type, user_id, guild_id=None, details=None):
@@ -673,7 +372,7 @@ async def list_admins(interaction: discord.Interaction):
             try:
                 user = await client.fetch_user(admin_id)
                 admin_details.append(f"• {user.name} (ID: {admin_id})")
-            except:
+            except discord.HTTPException:
                 admin_details.append(f"• Unknown User (ID: {admin_id})")
         
         if admin_details:
@@ -790,7 +489,11 @@ async def server_blacklist(interaction: discord.Interaction, server_id: str, add
 @tree.command(name="server_settings", description="Configure bot settings for this server (requires Manage Server permission)")
 @discord.app_commands.checks.cooldown(1, 5.0)  # 1 use per 5 seconds per user
 @discord.app_commands.checks.has_permissions(manage_guild=True)
-async def configure_server(interaction: discord.Interaction, enable_bot: bool = None, allowed_channels: bool = None):
+async def configure_server(
+    interaction: discord.Interaction,
+    enable_bot: bool | None = None,
+    allowed_channels: bool | None = None,
+):
     """Configure server-specific settings for the bot"""
     logger.info(f"Received /server_settings command from {interaction.user} in guild {interaction.guild}")
     
@@ -886,6 +589,7 @@ def register_persistent_views():
         return
     client.add_view(MessageControlView(timeout=None))
     client.add_view(TikTokControlView(original_url="https://example.com", timeout=None))
+    client.add_view(TikTokCardView.persistent_placeholder())
     client.add_view(InstagramControlView(original_url="https://example.com", timeout=None))
     client.add_view(YouTubeControlView(original_url="https://example.com", timeout=None))
     persistent_views_registered = True
@@ -941,6 +645,9 @@ async def security_maintenance():
             # Prune old rate limit data
             now = time.time()
             runtime_state.prune_user_entries(older_than_seconds=3600, now=now)
+            state.prune_message_ownership(
+                int(now) - (CONFIG.ownership_retention_days * 24 * 60 * 60)
+            )
             
             # Wait for 1 hour before the next run
             await asyncio.sleep(3600)
@@ -956,6 +663,7 @@ async def on_ready():
         user_emulation_preferences=user_emulation_preferences,
         default_emulation=DEFAULT_EMULATION,
         fetch_user=client.fetch_user,
+        state=state,
     )
     register_persistent_views()
     if CONFIG.use_nvidia_gpu:
@@ -1064,15 +772,17 @@ async def on_message(message):
             logger.info(f"User {message.author} is rate limited for Twitter/X processing.")
             return
 
-        await maybe_delete_original_message(message, "twitter")
-
         should_emulate = user_emulation_preferences.get(message.author.id, DEFAULT_EMULATION)
         try:
-            links_processed += await send_twitter_rewrite_message(
+            twitter_processed = await send_twitter_rewrite_message(
                 message=message,
                 rewrite_result=rewrite_result,
                 should_emulate=should_emulate,
+                ownership_recorder=state.record_message_ownership,
             )
+            links_processed += twitter_processed
+            if twitter_processed:
+                await maybe_delete_original_message(message, "twitter")
         except Exception as e:
             logger.error(f"Error sending rewritten Twitter/X message for {message.id}: {e}")
 
@@ -1084,36 +794,18 @@ async def on_message(message):
             return
         tiktok_urls = [match.group(0) for match in tiktok_matches]
         logger.info(f"Processing TikTok links from {message.author} (ID: {message.id}) with URLs: {tiktok_urls}")
-        fallback_urls = []
-        kktiktok_processed = 0
-        for url in tiktok_urls:
-            if await try_kktiktok_embed(
-                message=message,
-                source_url=url,
-                view_factory=lambda original_url: TikTokControlView(original_url=original_url, timeout=604800),
-            ):
-                kktiktok_processed += 1
-            else:
-                fallback_urls.append(url)
-
-        if kktiktok_processed:
-            links_processed += kktiktok_processed
-            await maybe_delete_original_message(message, "TikTok")
-
-        if fallback_urls:
-            links_processed += await process_media_links_shared(
-                message=message,
-                urls=fallback_urls,
-                source_name="TikTok",
-                icon="🎵",
-                url_validator=validate_tiktok_url_safe,
-                downloader=download_tiktok_video,
-                view_factory=lambda url: TikTokControlView(original_url=url, timeout=604800),
-                compressor=compress_video_to_limit_safe,
-                semaphore=media_semaphore,
-                config=media_config,
-                embed_factory=lambda result, url: build_tiktok_embed(result, url, include_details=include_media_details),
-            )
+        links_processed += await process_tiktok_links(
+            message=message,
+            urls=tiktok_urls,
+            url_validator=validate_tiktok_url_safe,
+            downloader=download_tiktok_video,
+            compressor=compress_video_to_limit_safe,
+            fallback_view_factory=lambda url: TikTokControlView(original_url=url, timeout=604800),
+            ownership_recorder=state.record_message_ownership,
+            semaphore=media_semaphore,
+            config=media_config,
+            icon=TIKTOK_ICON,
+        )
 
     # Process Instagram links
     instagram_matches = list(INSTAGRAM_URL_REGEX.finditer(message.content))
@@ -1136,6 +828,7 @@ async def on_message(message):
             config=media_config,
             default_media_label="media",
             embed_factory=lambda result, url: build_instagram_embed(result, url, include_details=include_media_details),
+            ownership_recorder=state.record_message_ownership,
         )
 
     # Process YouTube links
@@ -1158,6 +851,7 @@ async def on_message(message):
             semaphore=media_semaphore,
             config=media_config,
             embed_factory=lambda result, url: build_youtube_embed(result, url, include_details=include_media_details),
+            ownership_recorder=state.record_message_ownership,
         )
 
 # Run the bot

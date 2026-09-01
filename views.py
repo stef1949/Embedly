@@ -1,21 +1,36 @@
 from __future__ import annotations
 
 import logging
-from typing import Awaitable, Callable, Optional
+import sqlite3
+from typing import Awaitable, Callable, Optional, Protocol
 
 import discord
 
-from security import can_manage_bot_message, extract_author_id
+from persistence import MessageOwnership
+from security import can_manage_bot_message
+from tiktok_handler import TIKTOK_ABOUT_URL, TikTokPost, escape_discord_text
 
 logger = logging.getLogger(__name__)
 
 _IsAdminFn = Callable[[int], bool]
 _FetchUserFn = Callable[[int], Awaitable[discord.User]]
 
+
+class ViewState(Protocol):
+    def get_message_ownership(
+        self,
+        message_id: int,
+        channel_id: int,
+        guild_id: int | None,
+    ) -> MessageOwnership | None: ...
+
+    def delete_message_ownership(self, message_id: int) -> bool: ...
+
 _is_admin: Optional[_IsAdminFn] = None
 _user_emulation_preferences: Optional[dict[int, bool]] = None
 _default_emulation: bool = True
 _fetch_user: Optional[_FetchUserFn] = None
+_state: ViewState | None = None
 
 
 def configure_view_context(
@@ -24,16 +39,68 @@ def configure_view_context(
     user_emulation_preferences: dict[int, bool],
     default_emulation: bool,
     fetch_user: _FetchUserFn,
+    state: ViewState,
 ) -> None:
-    global _is_admin, _user_emulation_preferences, _default_emulation, _fetch_user
+    global _is_admin, _user_emulation_preferences, _default_emulation, _fetch_user, _state
     _is_admin = is_admin
     _user_emulation_preferences = user_emulation_preferences
     _default_emulation = default_emulation
     _fetch_user = fetch_user
+    _state = state
+
+
+def _message_coordinates(
+    message: discord.Message,
+    interaction: discord.Interaction,
+) -> tuple[int, int, int | None] | None:
+    message_id = getattr(message, "id", None)
+    channel = getattr(message, "channel", None)
+    channel_id = getattr(channel, "id", None) or getattr(interaction, "channel_id", None)
+    guild = getattr(message, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    if guild_id is None:
+        guild_id = getattr(interaction, "guild_id", None)
+    if not isinstance(message_id, int) or message_id <= 0:
+        return None
+    if not isinstance(channel_id, int) or channel_id <= 0:
+        return None
+    if guild_id is not None and (not isinstance(guild_id, int) or guild_id <= 0):
+        return None
+    return message_id, channel_id, guild_id
+
+
+def _lookup_ownership(
+    message: discord.Message,
+    interaction: discord.Interaction,
+) -> MessageOwnership | None:
+    if _state is None:
+        return None
+    coordinates = _message_coordinates(message, interaction)
+    if coordinates is None:
+        return None
+    try:
+        return _state.get_message_ownership(*coordinates)
+    except (sqlite3.Error, LookupError, OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Message ownership lookup failed (%s)", type(exc).__name__)
+        return None
+
+
+def _fallback_owner_id(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+async def _safe_ephemeral_response(interaction: discord.Interaction, content: str) -> None:
+    await interaction.response.send_message(
+        content,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 class BaseControlView(discord.ui.View):
-    def __init__(self, timeout: float = 604800):
+    def __init__(self, timeout: float | None = 604800):
         super().__init__(timeout=timeout)
         self.message = None
         self.original_author_id = None
@@ -48,10 +115,10 @@ class BaseControlView(discord.ui.View):
             logger.debug("View timeout edit skipped: %s", e)
 
     def _resolve_author_id(self, message: discord.Message, interaction: discord.Interaction) -> Optional[int]:
-        author_id = extract_author_id(message, self.original_author_id)
-        if not author_id and getattr(message, "webhook_id", None):
-            author_id = interaction.user.id
-        return author_id
+        ownership = _lookup_ownership(message, interaction)
+        if ownership is not None:
+            return ownership.original_author_id
+        return _fallback_owner_id(self.original_author_id)
 
     def _can_manage(self, interaction: discord.Interaction, author_id: Optional[int]) -> bool:
         if _is_admin is None:
@@ -68,6 +135,11 @@ class MessageControlView(BaseControlView):
                 await interaction.response.send_message("You are not allowed to delete this message.", ephemeral=True)
                 return
             await interaction.message.delete()
+            if _state is not None:
+                try:
+                    _state.delete_message_ownership(interaction.message.id)
+                except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
+                    logger.warning("Could not delete ownership record (%s)", type(exc).__name__)
             await interaction.response.send_message("Message deleted.", ephemeral=True)
         except discord.NotFound:
             await interaction.response.send_message("Message already deleted.", ephemeral=True)
@@ -101,7 +173,7 @@ class MessageControlView(BaseControlView):
 
 
 class MediaControlView(BaseControlView):
-    def __init__(self, original_url: str, timeout: float = 604800):
+    def __init__(self, original_url: str, timeout: float | None = 604800):
         super().__init__(timeout=timeout)
         self.add_item(discord.ui.Button(label="Open Link", style=discord.ButtonStyle.link, url=original_url))
 
@@ -112,6 +184,11 @@ class MediaControlView(BaseControlView):
                 await interaction.response.send_message("You are not allowed to delete this message.", ephemeral=True)
                 return
             await interaction.message.delete()
+            if _state is not None:
+                try:
+                    _state.delete_message_ownership(interaction.message.id)
+                except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
+                    logger.warning("Could not delete ownership record (%s)", type(exc).__name__)
             await interaction.response.send_message("Message deleted.", ephemeral=True)
         except discord.NotFound:
             await interaction.response.send_message("Message already deleted.", ephemeral=True)
@@ -136,3 +213,153 @@ class YouTubeControlView(MediaControlView):
     @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, custom_id="youtube_delete_button")
     async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._handle_delete(interaction)
+
+
+class _TikTokInformationButton(discord.ui.Button["TikTokCardView"]):
+    def __init__(self) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            emoji="ℹ️",
+            custom_id="embedly:tiktok:information",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if self.view is not None:
+            await self.view.show_information(interaction)
+
+
+class _TikTokTranscriptButton(discord.ui.Button["TikTokCardView"]):
+    def __init__(self) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="Transcript",
+            custom_id="embedly:tiktok:transcript",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if self.view is not None:
+            await self.view.show_transcript(interaction)
+
+
+class TikTokCardView(discord.ui.LayoutView):
+    """TikTok-only Components V2 card with persistent, fail-closed callbacks."""
+
+    def __init__(
+        self,
+        *,
+        post: TikTokPost,
+        media: str | discord.File,
+        icon: str,
+        timeout: float | None = 604800,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.message: discord.Message | None = None
+        self.original_author_id: int | None = None
+        self.details = post.information_text
+        self.transcript = post.transcript
+
+        gallery_description = None
+        if post.description:
+            gallery_description = escape_discord_text(post.description)[:256]
+
+        links = (
+            f"[Open in TikTok]({post.original_url})"
+            f"  •  [About Embedly]({TIKTOK_ABOUT_URL})"
+        )
+        controls = discord.ui.ActionRow(
+            _TikTokInformationButton(),
+            _TikTokTranscriptButton(),
+        )
+        container = discord.ui.Container(
+            discord.ui.TextDisplay(f"{icon} {post.creator_display}"),
+            discord.ui.MediaGallery(
+                discord.MediaGalleryItem(media=media, description=gallery_description)
+            ),
+            discord.ui.Separator(spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay(links),
+            discord.ui.TextDisplay(post.engagement_text),
+            controls,
+            accent_colour=0x25F4EE,
+        )
+        self.add_item(container)
+
+    @classmethod
+    def persistent_placeholder(cls) -> "TikTokCardView":
+        post = TikTokPost(
+            display_name="TikTok creator",
+            handle=None,
+            creator_url="https://www.tiktok.com/",
+            original_url="https://www.tiktok.com/",
+            description=None,
+            duration_seconds=None,
+            upload_date=None,
+            width=None,
+            height=None,
+            like_count=None,
+            comment_count=None,
+            repost_count=None,
+            transcript=None,
+        )
+        return cls(
+            post=post,
+            media="https://www.tiktok.com/favicon.ico",
+            icon="🎵",
+            timeout=None,
+        )
+
+    async def on_timeout(self) -> None:
+        try:
+            for item in self.walk_children():
+                if hasattr(item, "disabled"):
+                    item.disabled = True
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception as exc:
+            logger.debug("TikTok card timeout edit skipped: %s", exc)
+
+    def _ownership(self, interaction: discord.Interaction) -> MessageOwnership | None:
+        message = interaction.message
+        if message is None:
+            return None
+        return _lookup_ownership(message, interaction)
+
+    def _author_id(
+        self,
+        interaction: discord.Interaction,
+        ownership: MessageOwnership | None,
+    ) -> int | None:
+        if ownership is not None:
+            return ownership.original_author_id
+        return _fallback_owner_id(self.original_author_id)
+
+    def _can_use(
+        self,
+        interaction: discord.Interaction,
+        ownership: MessageOwnership | None,
+    ) -> bool:
+        if _is_admin is None:
+            return False
+        return can_manage_bot_message(
+            interaction,
+            self._author_id(interaction, ownership),
+            is_bot_admin=_is_admin,
+        )
+
+    async def show_information(self, interaction: discord.Interaction) -> None:
+        ownership = self._ownership(interaction)
+        if not self._can_use(interaction, ownership):
+            await _safe_ephemeral_response(interaction, "You are not allowed to use this control.")
+            return
+        details = ownership.details if ownership is not None else self.details
+        await _safe_ephemeral_response(interaction, details or "Post details are unavailable.")
+
+    async def show_transcript(self, interaction: discord.Interaction) -> None:
+        ownership = self._ownership(interaction)
+        if not self._can_use(interaction, ownership):
+            await _safe_ephemeral_response(interaction, "You are not allowed to use this control.")
+            return
+        transcript = ownership.transcript if ownership is not None else self.transcript
+        await _safe_ephemeral_response(
+            interaction,
+            transcript or "Transcript unavailable for this post",
+        )

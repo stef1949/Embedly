@@ -1,28 +1,23 @@
 from __future__ import annotations
 
-import re
 from typing import Callable, Optional
 
 import discord
 
-MENTION_PATTERNS = [
-    r"<@!?(\d+)>",
-    r"shared by <@!?(\d+)>",
-    r"by <@!?(\d+)>",
-    r"by <@!?(\d+)",
-    r"<@!?(\d+)",
-    r"(\d{17,20})",
-]
-
-
 def extract_author_id(message: discord.Message, fallback_author_id: Optional[int] = None) -> Optional[int]:
-    if fallback_author_id:
+    """Return only an owner ID supplied by trusted sending code.
+
+    ``message`` is retained for API compatibility. Message content, mentions,
+    handles and URLs are deliberately never treated as ownership evidence.
+    """
+
+    del message
+    if (
+        isinstance(fallback_author_id, int)
+        and not isinstance(fallback_author_id, bool)
+        and fallback_author_id > 0
+    ):
         return fallback_author_id
-    content = message.content or ""
-    for pattern in MENTION_PATTERNS:
-        match = re.search(pattern, content)
-        if match:
-            return int(match.group(1))
     return None
 
 

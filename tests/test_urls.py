@@ -2,13 +2,13 @@ import unittest
 from urllib.parse import urlparse
 
 from utils.urls import (
-    rewrite_twitter_urls,
-    rewrite_tiktok_url,
-    is_tiktok_url,
     is_instagram_url,
+    is_tiktok_url,
     is_youtube_url,
-    validate_tiktok_url,
+    rewrite_tiktok_url,
+    rewrite_twitter_urls,
     validate_instagram_url,
+    validate_tiktok_url,
     validate_youtube_url,
 )
 

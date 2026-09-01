@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass
 
 
@@ -33,10 +34,13 @@ class BotConfig:
     upload_limit_bytes: int = 8 * 1024 * 1024
     default_emulation: bool = True
     log_level: str = "INFO"
-    temp_directory: str = "/tmp"
+    temp_directory: str = tempfile.gettempdir()
     use_nvidia_gpu: bool = False
     ffmpeg_headroom_ratio: float = 0.95
     media_concurrency: int = 3
+    state_database_path: str = "embedly_state.sqlite3"
+    tiktok_emoji: str = ""
+    ownership_retention_days: int = 30
 
 
 
@@ -44,6 +48,10 @@ def load_config() -> BotConfig:
     token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
     if not token:
         raise ValueError("No Discord token provided. Please set DISCORD_BOT_TOKEN.")
+
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    if log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
+        log_level = "INFO"
 
     headroom_raw = os.getenv("FFMPEG_HEADROOM_RATIO", "0.95")
     try:
@@ -62,9 +70,12 @@ def load_config() -> BotConfig:
         ffmpeg_timeout_seconds=_get_int("FFMPEG_TIMEOUT_SECONDS", 120, 10),
         upload_limit_bytes=_get_int("UPLOAD_LIMIT_BYTES", 8 * 1024 * 1024, 1024),
         default_emulation=_get_bool("DEFAULT_EMULATION", True),
-        log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        temp_directory=os.getenv("TEMP_DIRECTORY", "/tmp"),
+        log_level=log_level,
+        temp_directory=os.getenv("TEMP_DIRECTORY", tempfile.gettempdir()),
         use_nvidia_gpu=_get_bool("USE_NVIDIA_GPU", False),
         ffmpeg_headroom_ratio=headroom,
         media_concurrency=_get_int("MEDIA_CONCURRENCY", 3, 1),
+        state_database_path=os.getenv("STATE_DATABASE_PATH", "embedly_state.sqlite3"),
+        tiktok_emoji=os.getenv("TIKTOK_EMOJI", ""),
+        ownership_retention_days=_get_int("OWNERSHIP_RETENTION_DAYS", 30, 1),
     )

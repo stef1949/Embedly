@@ -2,13 +2,18 @@
 
 ## Supported Versions
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+Security fixes are applied to the latest code on the `main` branch. Older
+commits and forks are not maintained by this project.
 
 ## Reporting a Vulnerability
 
-Use this section to tell people how to report a vulnerability.
+Please do not disclose suspected vulnerabilities in a public issue, discussion,
+or pull request. Report them privately through a
+[GitHub security advisory](https://github.com/stef1949/Embedly/security/advisories/new).
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+Include the affected component, reproduction steps or a proof of concept,
+expected impact, and any suggested remediation. Avoid including real Discord
+tokens, personal data, or credentials in the report.
+
+The maintainers will validate the report, coordinate a fix when appropriate,
+and discuss disclosure timing with the reporter before publication.

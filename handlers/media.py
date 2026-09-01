@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
+import sqlite3
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Sequence
 
 import discord
 
 from services.downloaders import DownloadResult
 
 logger = logging.getLogger(__name__)
+OwnershipRecorder = Callable[..., object]
 
 
 @dataclass(frozen=True)
@@ -24,21 +27,27 @@ class MediaProcessingConfig:
     use_nvidia_gpu: bool
 
 
-async def delete_message_silently(message: discord.Message) -> None:
+async def delete_message_silently(message: discord.Message | None) -> None:
+    if message is None:
+        return
     try:
         await message.delete()
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         pass
 
 
-async def maybe_delete_original_message(message: discord.Message, context: str) -> None:
+async def maybe_delete_original_message(message: discord.Message, context: str) -> bool:
     try:
         await message.delete()
         logger.info("Deleted original %s message %s", context, message.id)
+        return True
+    except discord.NotFound:
+        logger.info("Original %s message %s was already deleted", context, message.id)
     except discord.Forbidden:
         logger.warning("Missing permissions to delete %s message %s", context, message.id)
     except discord.HTTPException as exc:
         logger.error("Failed to delete %s message %s: %s", context, message.id, exc)
+    return False
 
 
 def cleanup_file(filepath: str) -> None:
@@ -75,6 +84,7 @@ async def process_media_links(
     config: MediaProcessingConfig,
     embed_factory: Callable[[DownloadResult, str], discord.Embed] | None = None,
     default_media_label: str = "video",
+    ownership_recorder: OwnershipRecorder | None = None,
 ) -> int:
     processed = 0
     for source_url in urls:
@@ -150,11 +160,27 @@ async def process_media_links(
                 sent_message = await message.channel.send(**send_kwargs)
                 media_view.message = sent_message
 
+            if ownership_recorder is not None:
+                try:
+                    await _record_ownership(
+                        ownership_recorder,
+                        sent_message,
+                        source_message=message,
+                        message_type=source_name.casefold(),
+                    )
+                except (sqlite3.Error, LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                    logger.error(
+                        "%s ownership persistence failed (%s); preserving source message",
+                        source_name,
+                        type(exc).__name__,
+                    )
+                    continue
+
             processed += 1
             await maybe_delete_original_message(message, source_name)
         except asyncio.TimeoutError:
             logger.error("%s operation timed out for URL: %s", source_name, validated_url)
-        except (discord.HTTPException, discord.Forbidden, OSError, IOError) as exc:
+        except (discord.HTTPException, discord.Forbidden, OSError) as exc:
             logger.error("Error processing %s media %s: %s", source_name, validated_url, exc)
         finally:
             await delete_message_silently(processing_msg)
@@ -164,3 +190,32 @@ async def process_media_links(
                 cleanup_file(original_filepath)
 
     return processed
+
+
+async def _record_ownership(
+    recorder: OwnershipRecorder,
+    sent_message: discord.Message,
+    *,
+    source_message: discord.Message,
+    message_type: str,
+) -> None:
+    message_id = getattr(sent_message, "id", None)
+    channel_id = getattr(getattr(sent_message, "channel", None), "id", None)
+    if channel_id is None:
+        channel_id = getattr(getattr(source_message, "channel", None), "id", None)
+    guild_id = getattr(getattr(sent_message, "guild", None), "id", None)
+    if guild_id is None:
+        guild_id = getattr(getattr(source_message, "guild", None), "id", None)
+    author_id = getattr(getattr(source_message, "author", None), "id", None)
+    if not all(isinstance(value, int) and value > 0 for value in (message_id, channel_id, author_id)):
+        raise ValueError("Discord did not return trusted message ownership coordinates")
+
+    result = recorder(
+        message_id=message_id,
+        channel_id=channel_id,
+        guild_id=guild_id,
+        original_author_id=author_id,
+        message_type=message_type,
+    )
+    if inspect.isawaitable(result):
+        await result

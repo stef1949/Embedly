@@ -19,7 +19,7 @@ When you use the Bot, we automatically collect and process the following informa
 
 2. **Message Content:**
    - URLs from messages containing Twitter/X or TikTok links
-   - The content of messages is processed in real-time and is not permanently stored
+   - Message content is processed in real-time. For TikTok cards, the validated post details and downloaded caption text shown by the information/transcript buttons are stored temporarily with the replacement message's ownership record
 
 3. **Guild (Server) Information:**
    - Guild ID
@@ -70,7 +70,7 @@ We use the collected information for the following purposes:
 
 ### Temporary Data
 
-- **Message Content:** Processed in real-time and not permanently stored
+- **Message Content:** Processed in real-time. TikTok post details and downloaded caption text used by persistent card buttons are stored in the local SQLite state database for the configured ownership-retention period
 - **TikTok Videos:** Downloaded temporarily and deleted immediately after upload
 - **Rate Limit Data:** Automatically purged after 1 hour of inactivity
 
@@ -83,9 +83,10 @@ The following data is stored for the duration of the Bot's operation:
 - Server blacklist status
 - Administrator IDs
 - Server configuration settings
+- Replacement message, channel, guild and original-author IDs, plus TikTok callback text, for the configured ownership-retention period
 - Security audit logs (stored in `bot.log` file)
 
-**Data Retention:** All data is stored in-memory and in local log files. When the Bot restarts, in-memory data (preferences, settings) is reset to defaults. Log files are retained for troubleshooting and security purposes.
+**Data Retention:** Runtime preferences and settings remain in memory and reset when the Bot restarts. Trusted replacement-message ownership coordinates and TikTok callback text are stored in the local SQLite state database and pruned after `OWNERSHIP_RETENTION_DAYS` (30 days by default). Log files are retained for troubleshooting and security purposes.
 
 ## Data Sharing and Disclosure
 

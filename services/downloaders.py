@@ -5,6 +5,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import yt_dlp
@@ -70,7 +71,12 @@ def detect_media_type(filepath: str | None, metadata: dict[str, Any] | None = No
     return "video"
 
 
-def download_media(media_url: str, output_folder: str | None = None, use_nvidia_gpu: bool = False) -> DownloadResult:
+def download_media(
+    media_url: str,
+    output_folder: str | None = None,
+    use_nvidia_gpu: bool = False,
+    download_subtitles: bool = False,
+) -> DownloadResult:
     output_folder = output_folder or tempfile.gettempdir()
     os.makedirs(output_folder, exist_ok=True)
     ydl_opts = _build_opts(output_folder, use_nvidia_gpu)
@@ -79,6 +85,17 @@ def download_media(media_url: str, output_folder: str | None = None, use_nvidia_
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             metadata = ydl.extract_info(media_url, download=False) or {}
             title = metadata.get("title") or "Unknown Title"
+            if download_subtitles:
+                subtitle_language = _select_subtitle_language(metadata)
+                if subtitle_language:
+                    ydl.params.update(
+                        {
+                            "writesubtitles": True,
+                            "writeautomaticsub": True,
+                            "subtitleslangs": [subtitle_language],
+                            "subtitlesformat": "vtt/best",
+                        }
+                    )
             info = ydl.extract_info(media_url, download=True) or {}
             merged_metadata = {**metadata, **info}
             title = str(merged_metadata.get("title") or title or "Unknown Title")
@@ -95,6 +112,9 @@ def download_media(media_url: str, output_folder: str | None = None, use_nvidia_
                         error=f"Downloaded file missing for {video_id}",
                         metadata=merged_metadata,
                     )
+            transcript = _consume_downloaded_subtitle(merged_metadata, filepath, output_folder)
+            if transcript:
+                merged_metadata["__embedly_transcript"] = transcript
             media_type = detect_media_type(filepath, merged_metadata)
             return DownloadResult(
                 success=True,
@@ -111,5 +131,67 @@ def download_media(media_url: str, output_folder: str | None = None, use_nvidia_
         return DownloadResult(success=False, error=str(exc))
 
 
-def download_video(video_url: str, output_folder: str | None = None, use_nvidia_gpu: bool = False) -> DownloadResult:
-    return download_media(video_url, output_folder=output_folder, use_nvidia_gpu=use_nvidia_gpu)
+def download_video(
+    video_url: str,
+    output_folder: str | None = None,
+    use_nvidia_gpu: bool = False,
+    download_subtitles: bool = False,
+) -> DownloadResult:
+    return download_media(
+        video_url,
+        output_folder=output_folder,
+        use_nvidia_gpu=use_nvidia_gpu,
+        download_subtitles=download_subtitles,
+    )
+
+
+def _select_subtitle_language(metadata: dict[str, Any]) -> str | None:
+    languages: list[str] = []
+    for container_name in ("subtitles", "automatic_captions"):
+        container = metadata.get(container_name)
+        if isinstance(container, dict):
+            languages.extend(str(language) for language in container if language != "live_chat")
+    if not languages:
+        return None
+    unique_languages = list(dict.fromkeys(languages))
+    return min(
+        unique_languages,
+        key=lambda language: (not language.casefold().startswith("en"), language.casefold()),
+    )
+
+
+def _consume_downloaded_subtitle(
+    metadata: dict[str, Any],
+    media_filepath: str,
+    output_folder: str,
+) -> str | None:
+    requested = metadata.get("requested_subtitles")
+    if not isinstance(requested, dict):
+        return None
+
+    output_directory = Path(output_folder).resolve()
+    media_path = Path(media_filepath).resolve()
+    for value in requested.values():
+        entries = value if isinstance(value, list) else [value]
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("filepath"), str):
+                continue
+            candidate = Path(entry["filepath"]).resolve()
+            if (
+                candidate == media_path
+                or candidate.parent != output_directory
+                or candidate.suffix.casefold() not in {".vtt", ".srt", ".ttml"}
+            ):
+                continue
+            try:
+                if not candidate.is_file():
+                    continue
+                oversized = candidate.stat().st_size > 128 * 1024
+                text = "" if oversized else candidate.read_text(encoding="utf-8", errors="replace")
+                candidate.unlink()
+            except OSError as exc:
+                logger.warning("Could not consume downloaded subtitle %s: %s", candidate.name, exc)
+                continue
+            if text.strip():
+                return text
+    return None

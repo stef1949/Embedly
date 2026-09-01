@@ -7,9 +7,23 @@ __pycache__/
 *$py.class
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
+
+# Test, coverage, and lint caches
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging output
+build/
+dist/
+*.egg-info/
 
 # IDE specific files
 .vscode/
@@ -18,6 +32,12 @@ ENV/
 # Logs
 *.log
 
+# Runtime state
+embedly_state.sqlite3
+embedly_state.sqlite3-shm
+embedly_state.sqlite3-wal
+
 # OS specific files
 .DS_Store
 Thumbs.db
+Desktop.ini

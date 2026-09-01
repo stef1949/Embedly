@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import logging
+from collections.abc import Callable
+
 import discord
 
 from utils.urls import RewriteResult
@@ -11,6 +14,7 @@ logger = logging.getLogger(__name__)
 WEBHOOK_NAME = "Embedly"
 LEGACY_WEBHOOK_NAMES = {"TempWebhook"}
 _webhook_cache: dict[int, discord.Webhook] = {}
+OwnershipRecorder = Callable[..., object]
 
 
 async def send_twitter_rewrite_message(
@@ -18,6 +22,7 @@ async def send_twitter_rewrite_message(
     message: discord.Message,
     rewrite_result: RewriteResult,
     should_emulate: bool,
+    ownership_recorder: OwnershipRecorder | None = None,
 ) -> int:
     links_processed = 0
 
@@ -34,6 +39,13 @@ async def send_twitter_rewrite_message(
         embed.add_field(name="Link", value=spoiler_response, inline=False)
         sent = await message.channel.send(content="||spoiler||", embed=embed, view=spoiler_view)
         spoiler_view.message = sent
+        if ownership_recorder is not None:
+            await _record_ownership(
+                ownership_recorder,
+                sent,
+                source_message=message,
+                message_type="twitter_spoiler",
+            )
 
     if rewrite_result.rewritten_urls:
         links_processed += len(rewrite_result.rewritten_urls)
@@ -42,6 +54,13 @@ async def send_twitter_rewrite_message(
         response = "\n".join(rewrite_result.rewritten_urls)
         sent = await _send_with_optional_emulation(message=message, content=response, view=view, emulate=should_emulate)
         view.message = sent
+        if ownership_recorder is not None:
+            await _record_ownership(
+                ownership_recorder,
+                sent,
+                source_message=message,
+                message_type="twitter",
+            )
 
     return links_processed
 
@@ -129,3 +148,31 @@ def _webhook_belongs_to_bot(webhook: discord.Webhook, bot_user: discord.abc.User
     webhook_user = getattr(webhook, "user", None)
     webhook_user_id = getattr(webhook_user, "id", None)
     return webhook_user_id == bot_user.id
+
+
+async def _record_ownership(
+    recorder: OwnershipRecorder,
+    sent_message: discord.Message,
+    *,
+    source_message: discord.Message,
+    message_type: str,
+) -> None:
+    message_id = getattr(sent_message, "id", None)
+    channel_id = getattr(getattr(sent_message, "channel", None), "id", None)
+    if channel_id is None:
+        channel_id = getattr(getattr(source_message, "channel", None), "id", None)
+    guild_id = getattr(getattr(sent_message, "guild", None), "id", None)
+    if guild_id is None:
+        guild_id = getattr(getattr(source_message, "guild", None), "id", None)
+    author_id = getattr(getattr(source_message, "author", None), "id", None)
+    if not all(isinstance(value, int) and value > 0 for value in (message_id, channel_id, author_id)):
+        raise ValueError("Discord did not return trusted message ownership coordinates")
+    result = recorder(
+        message_id=message_id,
+        channel_id=channel_id,
+        guild_id=guild_id,
+        original_author_id=author_id,
+        message_type=message_type,
+    )
+    if inspect.isawaitable(result):
+        await result

@@ -5,9 +5,9 @@ from instagram_handler import (
     _decode_json_string,
     _fetch_instagram_image_metadata,
     _parse_meta_tags,
+    build_instagram_embed,
     download_instagram_media,
 )
-from instagram_handler import build_instagram_embed
 from services.downloaders import DownloadResult
 
 

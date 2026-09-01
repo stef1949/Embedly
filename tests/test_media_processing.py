@@ -3,8 +3,11 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from handlers.media import MediaProcessingConfig, process_media_links
+import discord
+
+from handlers.media import MediaProcessingConfig, maybe_delete_original_message, process_media_links
 from services.downloaders import DownloadResult, detect_media_type
 
 
@@ -61,6 +64,24 @@ def write_temp_file(folder: str, suffix: str, data: bytes) -> str:
 
 
 class MediaProcessingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_already_deleted_source_is_an_idempotent_outcome(self):
+        response = SimpleNamespace(status=404, reason="Not Found", headers={})
+        message = SimpleNamespace(
+            id=123,
+            delete=AsyncMock(
+                side_effect=discord.NotFound(
+                    response,
+                    {"code": 10008, "message": "Unknown Message"},
+                )
+            ),
+        )
+
+        with self.assertLogs("handlers.media", level="INFO") as logs:
+            deleted = await maybe_delete_original_message(message, "twitter")
+
+        self.assertFalse(deleted)
+        self.assertIn("was already deleted", logs.output[0])
+
     async def test_instagram_image_uploads_with_image_label(self):
         with tempfile.TemporaryDirectory() as folder:
             path = write_temp_file(folder, ".jpg", b"image bytes")

@@ -1,4 +1,7 @@
-<h1 align="center"> Embedly Bot </h1> <p align="center"> <img src="https://github.com/stef1949/Embedly/blob/6fb0f80cd5a015ea1fee0abdde3fc95e007ad1b6/IMG_3072.png?raw=true " width="200"> <p/>
+<div align="center">
+  <img src="IMG_3072.png" alt="Embedly Bot logo" width="200">
+  <h1>Embedly Bot</h1>
+</div>
 
 This Discord bot looks for Twitter/X links in messages and automatically replaces them with `vxtwitter.com` links. It also supports downloading and sharing TikTok videos, Instagram images/videos, and YouTube videos directly in Discord. It includes user identity emulation, interactive buttons, and comprehensive admin controls.
 
@@ -6,14 +9,14 @@ This Discord bot looks for Twitter/X links in messages and automatically replace
 
 ### Core Functionality
 * **URL Replacement:** Finds URLs containing `twitter.com` or `x.com` and replaces them with `vxtwitter.com`
-* **TikTok Embeds:** Rewrites TikTok links to `tnktok.com` for playable embeds with post stats, with automatic download and upload fallback when Discord cannot render the embed
+* **TikTok Components V2 cards:** Downloads TikTok videos into native Discord cards with creator attribution, playable media, compact engagement statistics, post information, and caption-backed transcripts when available
 * **Instagram Media Downloads:** Automatically downloads and shares Instagram images, videos, and reels with available engagement metadata when Instagram links are posted
 * **YouTube Video Downloads:** Automatically downloads and shares YouTube videos/shorts with available engagement metadata when YouTube links are posted
 * **User Emulation:** Can post links either as the original user (with their name and avatar) or as the bot with attribution
 * **Interactive Buttons:**
    * **Delete Button:** Lets the original message sender remove the bot's response
    * **Toggle Emulation Button:** Allows users to quickly switch their emulation preference
-* **Restart-Proof Design:** Buttons continue to work even after the bot restarts
+* **Restart-Proof Design:** Trusted message ownership and TikTok callback data are stored in SQLite so persistent buttons remain fail-closed and usable after restart
 
 ### Security & Administration
 * **Rate Limiting:** Per-user and global rate limits to prevent abuse
@@ -42,42 +45,71 @@ This Discord bot looks for Twitter/X links in messages and automatically replace
 
 ## Prerequisites
 * Python 3.10+
-* Discord.py 2.0+
+* discord.py 2.7.1+ (Components V2 support; the dependency is constrained to `<3`)
 * yt-dlp (for TikTok, Instagram, and YouTube media downloads)
 * FFmpeg (for video processing)
 * A Discord bot token
 * *Optional:* NVIDIA GPU with NVENC support for hardware-accelerated video encoding
 
 ## Setup
-1. **Clone the repository**
-2. **Install dependencies:** Run the following command to install required packages from requirements.txt:
+
+1. **Clone the repository:**
 
 ```sh
-pip install -r requirements.txt
+git clone https://github.com/stef1949/Embedly.git
+cd Embedly
 ```
 
-3. **Set up your environment variables:** Make sure to set your Discord bot token in your environment variables.
+2. **Create and activate a virtual environment:**
 
+```sh
+python -m venv .venv
 ```
+
+PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+macOS/Linux:
+
+```sh
+source .venv/bin/activate
+```
+
+3. **Install dependencies:**
+
+```sh
+python -m pip install -r requirements.txt
+```
+
+4. **Set the Discord bot token in the current shell:**
+
+PowerShell:
+
+```powershell
+$env:DISCORD_BOT_TOKEN = "your-token-here"
+```
+
+macOS/Linux:
+
+```sh
 export DISCORD_BOT_TOKEN=your_token_here
 ```
 
-Or create a `.env` file with:
+5. **Optional: enable NVIDIA GPU encoding:**
 
-```
-DISCORD_BOT_TOKEN=your_token_here
+PowerShell:
+
+```powershell
+$env:USE_NVIDIA_GPU = "true"
 ```
 
-4. **Optional: Enable NVIDIA GPU Encoding:** If you have an NVIDIA GPU with NVENC support, you can enable hardware-accelerated encoding:
+macOS/Linux:
 
-```
+```sh
 export USE_NVIDIA_GPU=true
-```
-
-Or add to your `.env` file:
-
-```
-USE_NVIDIA_GPU=true
 ```
 
 **Note:** NVIDIA GPU encoding requires:
@@ -85,17 +117,13 @@ USE_NVIDIA_GPU=true
 - FFmpeg compiled with NVENC support (`--enable-nvenc`)
 - NVIDIA drivers installed
 
-To verify FFmpeg has NVENC support, run:
-```sh
-ffmpeg -encoders | grep nvenc
-```
+To verify FFmpeg has NVENC support, run `ffmpeg -encoders` and look for `h264_nvenc`.
 
-5. **Run the bot:** Launch the bot by running:
+6. **Run the bot:**
 
 ```sh
 python embedbot.py
 ```
-
 
 ## Project layout
 
@@ -104,15 +132,26 @@ The codebase is organized into focused modules:
 * `embedbot.py` - bot entrypoint and Discord event/command wiring
 * `handlers/twitter.py` - Twitter/X rewrite message send flow
 * `handlers/media.py` - shared TikTok/Instagram/YouTube processing pipeline
+* `instagram_handler.py`, `tiktok_handler.py`, and `youtube_handler.py` - platform download and embed adapters
 * `services/downloaders.py` - yt-dlp download abstraction
 * `services/media_embeds.py` - shared metadata embed formatting
 * `services/transcode.py` - ffmpeg/ffprobe helpers and compression
 * `utils/urls.py` - URL parsing/validation/rewriting logic
 * `views.py` - persistent Discord UI control views
 * `runtime_state.py` - in-memory rate limiting state
+* `persistence.py` - trusted SQLite message ownership and TikTok callback state
 * `security.py` - authorization helpers for message controls
 
+## Tests
+
+After installing the dependencies, run the complete unit test suite with:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
 ## Environment variables
+
 The bot supports these environment variables (with defaults):
 
 * `DISCORD_BOT_TOKEN` (required)
@@ -124,25 +163,28 @@ The bot supports these environment variables (with defaults):
 * `UPLOAD_LIMIT_BYTES` (`8388608`)
 * `DEFAULT_EMULATION` (`true`)
 * `LOG_LEVEL` (`INFO`)
-* `TEMP_DIRECTORY` (`/tmp`)
+* `TEMP_DIRECTORY` (the operating system's temporary directory)
 * `USE_NVIDIA_GPU` (`false`)
 * `FFMPEG_HEADROOM_RATIO` (`0.95`)
 * `MEDIA_CONCURRENCY` (`3`)
+* `STATE_DATABASE_PATH` (`embedly_state.sqlite3`)
+* `TIKTOK_EMOJI` (optional full Discord custom emoji, for example `<:tiktok:123456789012345678>`; invalid values fall back to `🎵`)
+* `OWNERSHIP_RETENTION_DAYS` (`30`; minimum `1`)
 
 ## User Guide
 
 ### TikTok Embeds
 When you share a TikTok link in a channel where the bot is active:
 
-* The bot first rewrites the link to `tnktok.com` for a playable Discord embed with likes, comments, and reposts
-* If Discord does not render that embed, the bot falls back to downloading and sharing the video directly
-* The fallback uses yt-dlp and uploads the video directly when it fits Discord's file size limit
-* Fallback uploads show compact post info such as `❤️ **871**  💬 **4**  🔁 **187**`
-* You can enable the optional details section with `/media_details enable:true` to include creator, posted date, duration, and size
-* The original message is deleted and replaced with the downloaded video
-* The bot attributes the video to you with a mention
+* The primary presentation is a native Discord Components V2 card built with discord.py
+* The card includes the creator display name and linked handle, a playable Media Gallery attachment, links to the original post and Embedly, and compact statistics such as `♥ 784.6K   💬 6.2K   🔁 329.7K`
+* The information button shows whichever validated yt-dlp details are available, including description, date, duration, and resolution
+* The Transcript button uses a subtitle/caption track downloaded by yt-dlp when one is available. It does not use speech-to-text or a paid cloud API; without a caption source it reports `Transcript unavailable for this post`
+* The card is sent with `message.reply(..., mention_author=False)`, so Discord retains the reply reference and can show its original-message-deleted indicator
+* The source message is deleted only after Discord accepts the replacement and the exact message/channel/guild/user ownership record is committed to SQLite
+* Download, compression, upload, or card-construction failures fall back to a validated `tnktok.com` link. An ownership-database failure removes the unrecorded replacement when possible and preserves the source instead of weakening authorization
 
-**Note:** Videos larger than 8MB cannot be uploaded due to Discord's file size limits.
+**Note:** The configured upload limit still applies. Oversized videos use the existing FFmpeg compression path; if the compressed result still cannot be uploaded, the link fallback is used.
 
 ### Instagram Media Downloads
 When you share an Instagram link (posts, reels, IGTV) in a channel where the bot is active:
@@ -250,6 +292,17 @@ If button controls aren't working:
 * Server admins and bot owners can always use the controls
 * You can always use direct slash commands as an alternative
 
+For TikTok cards:
+
+* Confirm `python -m pip show discord.py` reports 2.7.1 or later and rerun `python -m pip install -r requirements.txt` after upgrading
+* Give the bot permission to attach files, send messages, read message history, and manage messages if source replacement is desired
+* Ensure `STATE_DATABASE_PATH` points to a writable location; ownership persistence failures deliberately preserve the source message
+* Supply `TIKTOK_EMOJI` as a complete custom emoji mention and ensure the bot can use that emoji; malformed configuration uses the safe `🎵` fallback
+* Check the log for yt-dlp, upload-limit, FFmpeg, or timeout failures when a `tnktok.com` fallback appears
+* Transcript availability depends on TikTok/yt-dlp exposing a downloadable caption track. Embedly does not synthesize a transcript from audio
+
+`STATE_DATABASE_PATH` stores Discord ownership coordinates plus the rendered TikTok information/transcript text needed by persistent callbacks. Protect this file as application data. Records older than `OWNERSHIP_RETENTION_DAYS` are removed by the hourly maintenance task. Existing bot messages created before this database was enabled have no trusted ownership row, so ordinary users are denied after a restart; server administrators and verified bot administrators retain their existing override behavior.
+
 ## Contributing
 Feel free to fork this repository and open issues or pull requests with improvements.
 
@@ -258,8 +311,6 @@ Feel free to fork this repository and open issues or pull requests with improvem
 By using this bot, you agree to our:
 * [Privacy Policy](PRIVACY_POLICY.md) - How we collect, use, and protect your data
 * [Terms of Service](TERMS_OF_SERVICE.md) - Rules and guidelines for using the bot
+* [Security Policy](SECURITY.md) - How to report a vulnerability privately
 
 Please review these documents to understand your rights and responsibilities when using the bot.
-
-## License
-This project is provided as-is under the terms in the LICENSE file.
