@@ -92,7 +92,11 @@ class InstagramEmbedTests(unittest.TestCase):
                 result = download_instagram_media("https://www.instagram.com/p/abc123/")
 
         self.assertIs(result, image_result)
-        download_media.assert_called_once_with("https://www.instagram.com/p/abc123/", output_folder=None)
+        download_media.assert_called_once_with(
+            "https://www.instagram.com/p/abc123/",
+            output_folder=None,
+            download_subtitles=True,
+        )
         download_image.assert_called_once_with("https://www.instagram.com/p/abc123/", output_folder=None)
 
     def test_download_instagram_media_does_not_fallback_for_unrelated_errors(self):

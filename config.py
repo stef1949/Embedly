@@ -4,6 +4,10 @@ import os
 import tempfile
 from dataclasses import dataclass
 
+DEFAULT_INSTAGRAM_EMOJI = "<:instagram:1544047809169195039>"
+DEFAULT_TIKTOK_EMOJI = "<:tiktok:1544047807596597248>"
+DEFAULT_TWITTER_EMOJI = "<:twitter:1544400500290486373>"
+
 
 def _get_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -39,7 +43,10 @@ class BotConfig:
     ffmpeg_headroom_ratio: float = 0.95
     media_concurrency: int = 3
     state_database_path: str = "embedly_state.sqlite3"
-    tiktok_emoji: str = ""
+    instagram_emoji: str = DEFAULT_INSTAGRAM_EMOJI
+    tiktok_emoji: str = DEFAULT_TIKTOK_EMOJI
+    twitter_emoji: str = DEFAULT_TWITTER_EMOJI
+    youtube_emoji: str = ""
     ownership_retention_days: int = 30
 
 
@@ -76,6 +83,9 @@ def load_config() -> BotConfig:
         ffmpeg_headroom_ratio=headroom,
         media_concurrency=_get_int("MEDIA_CONCURRENCY", 3, 1),
         state_database_path=os.getenv("STATE_DATABASE_PATH", "embedly_state.sqlite3"),
-        tiktok_emoji=os.getenv("TIKTOK_EMOJI", ""),
+        instagram_emoji=os.getenv("INSTAGRAM_EMOJI", DEFAULT_INSTAGRAM_EMOJI),
+        tiktok_emoji=os.getenv("TIKTOK_EMOJI", DEFAULT_TIKTOK_EMOJI),
+        twitter_emoji=os.getenv("TWITTER_EMOJI", DEFAULT_TWITTER_EMOJI),
+        youtube_emoji=os.getenv("YOUTUBE_EMOJI", ""),
         ownership_retention_days=_get_int("OWNERSHIP_RETENTION_DAYS", 30, 1),
     )

@@ -7,7 +7,7 @@ YOUTUBE_COLOR = 0xFF0000
 
 
 def download_youtube_video(video_url: str, output_folder: str | None = None) -> DownloadResult:
-    return download_video(video_url, output_folder=output_folder)
+    return download_video(video_url, output_folder=output_folder, download_subtitles=True)
 
 
 def build_youtube_embed(result: DownloadResult, original_url: str, *, include_details: bool = False) -> discord.Embed:

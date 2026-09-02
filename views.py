@@ -8,6 +8,7 @@ import discord
 
 from persistence import MessageOwnership
 from security import can_manage_bot_message
+from social_cards import ABOUT_EMBEDLY_URL, SocialPost, placeholder_post
 from tiktok_handler import TIKTOK_ABOUT_URL, TikTokPost, escape_discord_text
 
 logger = logging.getLogger(__name__)
@@ -362,4 +363,215 @@ class TikTokCardView(discord.ui.LayoutView):
         await _safe_ephemeral_response(
             interaction,
             transcript or "Transcript unavailable for this post",
+        )
+
+
+class _SocialInformationButton(discord.ui.Button["SocialMediaCardView"]):
+    def __init__(self, platform_key: str) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            emoji="ℹ️",
+            custom_id=f"embedly:{platform_key}:information",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if self.view is not None:
+            await self.view.show_information(interaction)
+
+
+class _SocialTranscriptButton(discord.ui.Button["SocialMediaCardView"]):
+    def __init__(self, platform_key: str) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="Transcript",
+            custom_id=f"embedly:{platform_key}:transcript",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if self.view is not None:
+            await self.view.show_transcript(interaction)
+
+
+class SocialMediaCardView(discord.ui.LayoutView):
+    """Components V2 card shared by non-TikTok social sources."""
+
+    def __init__(
+        self,
+        *,
+        post: SocialPost,
+        icon: str,
+        media: str | discord.File | None = None,
+        spoiler: bool = False,
+        include_details: bool = False,
+        timeout: float | None = 604800,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.message: discord.Message | None = None
+        self.original_author_id: int | None = None
+        self.details = post.information_text
+        self.transcript = post.transcript
+
+        children: list[discord.ui.Item] = [
+            discord.ui.TextDisplay(f"{icon} {post.creator_display}"),
+        ]
+        if media is not None:
+            gallery_description = None
+            if post.description:
+                gallery_description = escape_discord_text(post.description)[:256]
+            children.append(
+                discord.ui.MediaGallery(
+                    discord.MediaGalleryItem(media=media, description=gallery_description)
+                )
+            )
+        children.extend(
+            (
+                discord.ui.Separator(spacing=discord.SeparatorSpacing.small),
+                discord.ui.TextDisplay(
+                    f"[{post.open_label}]({post.original_url})"
+                    f"  •  [About Embedly]({ABOUT_EMBEDLY_URL})"
+                ),
+                discord.ui.TextDisplay(post.engagement_text),
+            )
+        )
+        if include_details and post.detail_summary:
+            children.append(discord.ui.TextDisplay(post.detail_summary))
+        children.append(
+            discord.ui.ActionRow(
+                _SocialInformationButton(post.platform_key),
+                _SocialTranscriptButton(post.platform_key),
+            )
+        )
+        self.add_item(
+            discord.ui.Container(
+                *children,
+                accent_colour=post.accent_colour,
+                spoiler=spoiler,
+            )
+        )
+
+    async def on_timeout(self) -> None:
+        try:
+            for item in self.walk_children():
+                if hasattr(item, "disabled"):
+                    item.disabled = True
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception as exc:
+            logger.debug("Social card timeout edit skipped: %s", exc)
+
+    def _ownership(self, interaction: discord.Interaction) -> MessageOwnership | None:
+        message = interaction.message
+        if message is None:
+            return None
+        return _lookup_ownership(message, interaction)
+
+    def _can_use(
+        self,
+        interaction: discord.Interaction,
+        ownership: MessageOwnership | None,
+    ) -> bool:
+        if _is_admin is None:
+            return False
+        author_id = ownership.original_author_id if ownership is not None else _fallback_owner_id(
+            self.original_author_id
+        )
+        return can_manage_bot_message(
+            interaction,
+            author_id,
+            is_bot_admin=_is_admin,
+        )
+
+    async def show_information(self, interaction: discord.Interaction) -> None:
+        ownership = self._ownership(interaction)
+        if not self._can_use(interaction, ownership):
+            await _safe_ephemeral_response(interaction, "You are not allowed to use this control.")
+            return
+        details = ownership.details if ownership is not None else self.details
+        await _safe_ephemeral_response(interaction, details or "Post details are unavailable.")
+
+    async def show_transcript(self, interaction: discord.Interaction) -> None:
+        ownership = self._ownership(interaction)
+        if not self._can_use(interaction, ownership):
+            await _safe_ephemeral_response(interaction, "You are not allowed to use this control.")
+            return
+        transcript = ownership.transcript if ownership is not None else self.transcript
+        await _safe_ephemeral_response(
+            interaction,
+            transcript or "Transcript unavailable for this post",
+        )
+
+
+class InstagramCardView(SocialMediaCardView):
+    def __init__(
+        self,
+        *,
+        post: SocialPost,
+        media: str | discord.File,
+        icon: str,
+        include_details: bool = False,
+        timeout: float | None = 604800,
+    ) -> None:
+        super().__init__(
+            post=post,
+            media=media,
+            icon=icon,
+            include_details=include_details,
+            timeout=timeout,
+        )
+
+    @classmethod
+    def persistent_placeholder(cls) -> "InstagramCardView":
+        return cls(
+            post=placeholder_post("instagram"),
+            media="https://www.instagram.com/favicon.ico",
+            icon="📸",
+            timeout=None,
+        )
+
+
+class YouTubeCardView(SocialMediaCardView):
+    def __init__(
+        self,
+        *,
+        post: SocialPost,
+        media: str | discord.File,
+        icon: str,
+        include_details: bool = False,
+        timeout: float | None = 604800,
+    ) -> None:
+        super().__init__(
+            post=post,
+            media=media,
+            icon=icon,
+            include_details=include_details,
+            timeout=timeout,
+        )
+
+    @classmethod
+    def persistent_placeholder(cls) -> "YouTubeCardView":
+        return cls(
+            post=placeholder_post("youtube"),
+            media="https://www.youtube.com/favicon.ico",
+            icon="▶️",
+            timeout=None,
+        )
+
+
+class TwitterCardView(SocialMediaCardView):
+    def __init__(
+        self,
+        *,
+        post: SocialPost,
+        icon: str,
+        spoiler: bool = False,
+        timeout: float | None = 604800,
+    ) -> None:
+        super().__init__(post=post, icon=icon, spoiler=spoiler, timeout=timeout)
+
+    @classmethod
+    def persistent_placeholder(cls) -> "TwitterCardView":
+        return cls(
+            post=placeholder_post("twitter"),
+            icon="𝕏",
+            timeout=None,
         )

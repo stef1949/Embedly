@@ -12,14 +12,22 @@ from config import load_config
 from handlers.media import (
     MediaProcessingConfig,
     maybe_delete_original_message,
-    process_media_links as process_media_links_shared,
+    process_native_media_links,
 )
 from handlers.tiktok import process_tiktok_links
 from handlers.twitter import send_twitter_rewrite_message
-from instagram_handler import build_instagram_embed, download_instagram_media
+from instagram_handler import download_instagram_media
 from persistence import SQLiteStateStore
 from runtime_state import RuntimeState
 from services.transcode import compress_video_to_limit as compress_video_to_limit_safe
+from social_cards import (
+    INSTAGRAM_FALLBACK_ICON,
+    TWITTER_FALLBACK_ICON,
+    YOUTUBE_FALLBACK_ICON,
+    extract_instagram_post,
+    extract_youtube_post,
+    resolve_platform_icon,
+)
 from tiktok_handler import download_tiktok_video, resolve_tiktok_icon
 from utils.urls import (
     rewrite_twitter_urls,
@@ -28,14 +36,17 @@ from utils.urls import (
     validate_youtube_url as validate_youtube_url_safe,
 )
 from views import (
+    InstagramCardView,
     InstagramControlView,
     MessageControlView,
     TikTokCardView,
     TikTokControlView,
+    TwitterCardView,
+    YouTubeCardView,
     YouTubeControlView,
     configure_view_context,
 )
-from youtube_handler import build_youtube_embed, download_youtube_video
+from youtube_handler import download_youtube_video
 
 CONFIG = load_config()
 TOKEN = CONFIG.discord_token
@@ -77,6 +88,9 @@ RATE_LIMIT_SECONDS = CONFIG.rate_limit_seconds
 runtime_state = RuntimeState()
 state = SQLiteStateStore(CONFIG.state_database_path)
 TIKTOK_ICON = resolve_tiktok_icon(CONFIG.tiktok_emoji)
+INSTAGRAM_ICON = resolve_platform_icon(CONFIG.instagram_emoji, INSTAGRAM_FALLBACK_ICON)
+TWITTER_ICON = resolve_platform_icon(CONFIG.twitter_emoji, TWITTER_FALLBACK_ICON)
+YOUTUBE_ICON = resolve_platform_icon(CONFIG.youtube_emoji, YOUTUBE_FALLBACK_ICON)
 
 # User preferences for emulation (True = emulate user, False = post as bot)
 user_emulation_preferences = {}  # Maps user ID to boolean preference
@@ -272,17 +286,16 @@ async def help_command(interaction: discord.Interaction):
         emulation_note = "\n⚠️ **Note:** User emulation requires webhook permissions, which the bot doesn't have in this channel."
     
     help_text = (
-        "This bot replaces `twitter.com` or `x.com` links with `vxtwitter.com` for better embeds.\n\n"
+        "This bot replaces Twitter/X, TikTok, Instagram, and YouTube links with native Discord cards.\n\n"
         "**Commands:**\n"
         "`/status` - Check bot status and statistics.\n"
         "`/help` - Show this help message.\n"
-        "`/emulate` - Choose whether the bot posts links as you or as itself.\n"
-        "`/media_details` - Choose whether your media embeds include extra details.\n\n"
+        "`/emulate` - Choose whether Twitter/X fallback links post as you or as the bot.\n"
+        "`/media_details` - Add available date, duration, and dimensions to Instagram/YouTube cards.\n\n"
         "**Post Controls:**\n"
-        "When you share a Twitter/X link, it will be automatically converted, and you'll see:\n"
-        "- A `Delete` button - Remove your posted link\n"
-        "- A `Toggle Emulation` button - Quickly switch between posting styles\n\n"
-        f"Just share a Twitter/X link in any channel, and the bot will handle the rest!{emulation_note}"
+        "- Native cards include private `Information` and `Transcript` controls\n"
+        "- Legacy fallback posts retain owner-authorized `Delete` and `Toggle Emulation` controls\n\n"
+        f"Share a supported link in any enabled channel, and the bot will handle the rest!{emulation_note}"
     )
     
     try:
@@ -291,9 +304,9 @@ async def help_command(interaction: discord.Interaction):
         logger.error(f"Error responding to help command: {e}")
 
 # Slash command: /emulate
-@tree.command(name="emulate", description="Choose whether the bot should emulate your identity when posting links")
+@tree.command(name="emulate", description="Choose identity emulation for Twitter/X fallback links")
 async def emulate(interaction: discord.Interaction, enable: bool):
-    """Set whether the bot should post as you or as itself.
+    """Set whether Twitter/X fallback links should post as you or as the bot.
     
     Parameters:
     -----------
@@ -315,12 +328,12 @@ async def emulate(interaction: discord.Interaction, enable: bool):
     
     if enable:
         if can_use_webhooks:
-            message = "The bot will now post Twitter/X links with your name and avatar."
+            message = "Twitter/X fallback links will now use your name and avatar."
         else:
-            message = ("The bot will try to post Twitter/X links with your name and avatar. However, it may not work in "
+            message = ("The bot will try to post Twitter/X fallback links with your name and avatar. However, it may not work in "
                        "some channels due to missing webhook permissions. In those cases, it will mention you instead.")
     else:
-        message = "The bot will now post Twitter/X links as itself and mention you."
+        message = "Twitter/X fallback links will now post as the bot and mention you."
     
     try:
         await interaction.followup.send(message, ephemeral=True)
@@ -328,9 +341,9 @@ async def emulate(interaction: discord.Interaction, enable: bool):
         logger.error(f"Error responding to emulate command: {e}")
 
 # Slash command: /media_details
-@tree.command(name="media_details", description="Choose whether your media embeds include extra details")
+@tree.command(name="media_details", description="Show extra details on Instagram and YouTube cards")
 async def media_details(interaction: discord.Interaction, enable: bool):
-    """Set whether TikTok, Instagram, and YouTube embeds for this user include optional details."""
+    """Set whether Instagram and YouTube cards include an optional detail summary."""
     logger.info(f"Received /media_details command from {interaction.user} with value {enable}")
 
     await interaction.response.defer(ephemeral=True)
@@ -338,9 +351,9 @@ async def media_details(interaction: discord.Interaction, enable: bool):
     user_media_details_preferences[interaction.user.id] = enable
 
     if enable:
-        message = "Your future media embeds will include creator, posted date, duration, and size details when available."
+        message = "Your future Instagram and YouTube cards will include date, duration, and size when available."
     else:
-        message = "Your future media embeds will only include compact engagement metadata."
+        message = "Your future Instagram and YouTube cards will keep optional details in the Information button."
 
     try:
         await interaction.followup.send(message, ephemeral=True)
@@ -591,7 +604,10 @@ def register_persistent_views():
     client.add_view(TikTokControlView(original_url="https://example.com", timeout=None))
     client.add_view(TikTokCardView.persistent_placeholder())
     client.add_view(InstagramControlView(original_url="https://example.com", timeout=None))
+    client.add_view(InstagramCardView.persistent_placeholder())
     client.add_view(YouTubeControlView(original_url="https://example.com", timeout=None))
+    client.add_view(YouTubeCardView.persistent_placeholder())
+    client.add_view(TwitterCardView.persistent_placeholder())
     persistent_views_registered = True
     logger.info("Registered persistent views")
 
@@ -766,6 +782,9 @@ async def on_message(message):
         logger.warning("Global rate limit exceeded, ignoring message")
         return
 
+    message_links_expected = 0
+    message_links_replaced = 0
+
     rewrite_result = rewrite_twitter_urls(message.content)
     if rewrite_result.rewritten_urls or rewrite_result.spoiler_urls:
         if not runtime_state.allow_user_action(message.author.id, "twitter", RATE_LIMIT_SECONDS):
@@ -773,16 +792,18 @@ async def on_message(message):
             return
 
         should_emulate = user_emulation_preferences.get(message.author.id, DEFAULT_EMULATION)
+        twitter_expected = len(rewrite_result.rewritten_urls) + len(rewrite_result.spoiler_urls)
+        message_links_expected += twitter_expected
         try:
             twitter_processed = await send_twitter_rewrite_message(
                 message=message,
                 rewrite_result=rewrite_result,
                 should_emulate=should_emulate,
+                icon=TWITTER_ICON,
                 ownership_recorder=state.record_message_ownership,
             )
             links_processed += twitter_processed
-            if twitter_processed:
-                await maybe_delete_original_message(message, "twitter")
+            message_links_replaced += twitter_processed
         except Exception as e:
             logger.error(f"Error sending rewritten Twitter/X message for {message.id}: {e}")
 
@@ -793,8 +814,9 @@ async def on_message(message):
             logger.info(f"User {message.author} is rate limited for TikTok link.")
             return
         tiktok_urls = [match.group(0) for match in tiktok_matches]
+        message_links_expected += len(tiktok_urls)
         logger.info(f"Processing TikTok links from {message.author} (ID: {message.id}) with URLs: {tiktok_urls}")
-        links_processed += await process_tiktok_links(
+        tiktok_processed = await process_tiktok_links(
             message=message,
             urls=tiktok_urls,
             url_validator=validate_tiktok_url_safe,
@@ -805,7 +827,10 @@ async def on_message(message):
             semaphore=media_semaphore,
             config=media_config,
             icon=TIKTOK_ICON,
+            delete_source=False,
         )
+        links_processed += tiktok_processed
+        message_links_replaced += tiktok_processed
 
     # Process Instagram links
     instagram_matches = list(INSTAGRAM_URL_REGEX.finditer(message.content))
@@ -814,22 +839,29 @@ async def on_message(message):
             logger.info(f"User {message.author} is rate limited for Instagram link.")
             return
         instagram_urls = [match.group(0) for match in instagram_matches]
+        message_links_expected += len(instagram_urls)
         logger.info(f"Processing Instagram links from {message.author} (ID: {message.id}) with URLs: {instagram_urls}")
-        links_processed += await process_media_links_shared(
+        instagram_processed = await process_native_media_links(
             message=message,
             urls=instagram_urls,
             source_name="Instagram",
-            icon="📸",
+            platform_key="instagram",
+            icon=INSTAGRAM_ICON,
             url_validator=validate_instagram_url_safe,
             downloader=download_instagram_media,
-            view_factory=lambda url: InstagramControlView(original_url=url, timeout=604800),
+            post_factory=extract_instagram_post,
+            card_view_factory=InstagramCardView,
+            fallback_view_factory=lambda url: InstagramControlView(original_url=url, timeout=604800),
             compressor=compress_video_to_limit_safe,
             semaphore=media_semaphore,
             config=media_config,
             default_media_label="media",
-            embed_factory=lambda result, url: build_instagram_embed(result, url, include_details=include_media_details),
+            include_details=include_media_details,
             ownership_recorder=state.record_message_ownership,
+            delete_source=False,
         )
+        links_processed += instagram_processed
+        message_links_replaced += instagram_processed
 
     # Process YouTube links
     youtube_matches = list(YOUTUBE_URL_REGEX.finditer(message.content))
@@ -838,21 +870,31 @@ async def on_message(message):
             logger.info(f"User {message.author} is rate limited for YouTube link.")
             return
         youtube_urls = [match.group(0) for match in youtube_matches]
+        message_links_expected += len(youtube_urls)
         logger.info(f"Processing YouTube links from {message.author} (ID: {message.id}) with URLs: {youtube_urls}")
-        links_processed += await process_media_links_shared(
+        youtube_processed = await process_native_media_links(
             message=message,
             urls=youtube_urls,
             source_name="YouTube",
-            icon="YT",
+            platform_key="youtube",
+            icon=YOUTUBE_ICON,
             url_validator=validate_youtube_url_safe,
             downloader=download_youtube_video,
-            view_factory=lambda url: YouTubeControlView(original_url=url, timeout=604800),
+            post_factory=extract_youtube_post,
+            card_view_factory=YouTubeCardView,
+            fallback_view_factory=lambda url: YouTubeControlView(original_url=url, timeout=604800),
             compressor=compress_video_to_limit_safe,
             semaphore=media_semaphore,
             config=media_config,
-            embed_factory=lambda result, url: build_youtube_embed(result, url, include_details=include_media_details),
+            include_details=include_media_details,
             ownership_recorder=state.record_message_ownership,
+            delete_source=False,
         )
+        links_processed += youtube_processed
+        message_links_replaced += youtube_processed
+
+    if message_links_expected and message_links_replaced == message_links_expected:
+        await maybe_delete_original_message(message, "social media")
 
 # Run the bot
 client.run(TOKEN)

@@ -61,7 +61,7 @@ class MetaTagParser(HTMLParser):
 
 
 def download_instagram_media(media_url: str, output_folder: str | None = None) -> DownloadResult:
-    result = download_media(media_url, output_folder=output_folder)
+    result = download_media(media_url, output_folder=output_folder, download_subtitles=True)
     if result.success or not _should_try_image_fallback(result.error):
         return result
 

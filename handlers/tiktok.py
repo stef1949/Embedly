@@ -38,6 +38,7 @@ async def process_tiktok_links(
     semaphore: asyncio.Semaphore,
     config: MediaProcessingConfig,
     icon: str,
+    delete_source: bool = True,
 ) -> int:
     """Replace TikTok links with native Components V2 cards.
 
@@ -72,7 +73,7 @@ async def process_tiktok_links(
         if fallback_sent:
             processed += 1
 
-    if urls and processed == len(urls):
+    if delete_source and urls and processed == len(urls):
         await maybe_delete_original_message(message, "TikTok")
     return processed
 

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import inspect
 import logging
+import sqlite3
 from collections.abc import Callable
 
 import discord
 
+from social_cards import extract_twitter_post
 from utils.urls import RewriteResult
-from views import MessageControlView
+from views import MessageControlView, TwitterCardView
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +17,7 @@ WEBHOOK_NAME = "Embedly"
 LEGACY_WEBHOOK_NAMES = {"TempWebhook"}
 _webhook_cache: dict[int, discord.Webhook] = {}
 OwnershipRecorder = Callable[..., object]
+NO_MENTIONS = discord.AllowedMentions.none()
 
 
 async def send_twitter_rewrite_message(
@@ -22,47 +25,132 @@ async def send_twitter_rewrite_message(
     message: discord.Message,
     rewrite_result: RewriteResult,
     should_emulate: bool,
-    ownership_recorder: OwnershipRecorder | None = None,
+    icon: str,
+    ownership_recorder: OwnershipRecorder,
 ) -> int:
     links_processed = 0
 
-    if rewrite_result.spoiler_urls:
-        links_processed += len(rewrite_result.spoiler_urls)
-        spoiler_view = MessageControlView(timeout=604800)
-        spoiler_view.original_author_id = message.author.id
-        spoiler_response = "\n".join(rewrite_result.spoiler_urls)
-        embed = discord.Embed(
-            title="Spoiler Embed",
-            description="This tweet is hidden behind a spoiler. Click to reveal.",
-            color=0x1DA1F2,
+    for rewritten_url, spoiler in (
+        *((url, True) for url in rewrite_result.spoiler_urls),
+        *((url, False) for url in rewrite_result.rewritten_urls),
+    ):
+        native_sent = await _send_native_twitter_card(
+            message=message,
+            rewritten_url=rewritten_url,
+            spoiler=spoiler,
+            icon=icon,
+            ownership_recorder=ownership_recorder,
         )
-        embed.add_field(name="Link", value=spoiler_response, inline=False)
-        sent = await message.channel.send(content="||spoiler||", embed=embed, view=spoiler_view)
-        spoiler_view.message = sent
-        if ownership_recorder is not None:
-            await _record_ownership(
-                ownership_recorder,
-                sent,
-                source_message=message,
-                message_type="twitter_spoiler",
-            )
+        if native_sent:
+            links_processed += 1
+            continue
 
-    if rewrite_result.rewritten_urls:
-        links_processed += len(rewrite_result.rewritten_urls)
-        view = MessageControlView(timeout=604800)
-        view.original_author_id = message.author.id
-        response = "\n".join(rewrite_result.rewritten_urls)
-        sent = await _send_with_optional_emulation(message=message, content=response, view=view, emulate=should_emulate)
-        view.message = sent
-        if ownership_recorder is not None:
-            await _record_ownership(
-                ownership_recorder,
-                sent,
-                source_message=message,
-                message_type="twitter",
-            )
+        fallback_sent = await _send_legacy_twitter_link(
+            message=message,
+            rewritten_url=rewritten_url,
+            spoiler=spoiler,
+            should_emulate=should_emulate,
+            ownership_recorder=ownership_recorder,
+        )
+        if fallback_sent:
+            links_processed += 1
 
     return links_processed
+
+
+async def _send_native_twitter_card(
+    *,
+    message: discord.Message,
+    rewritten_url: str,
+    spoiler: bool,
+    icon: str,
+    ownership_recorder: OwnershipRecorder,
+) -> bool:
+    sent: discord.Message | None = None
+    try:
+        post = extract_twitter_post(rewritten_url)
+        view = TwitterCardView(post=post, icon=icon, spoiler=spoiler, timeout=604800)
+        view.original_author_id = message.author.id
+        sent = await message.reply(
+            view=view,
+            mention_author=False,
+            allowed_mentions=NO_MENTIONS,
+        )
+        view.message = sent
+        await _record_ownership(
+            ownership_recorder,
+            sent,
+            source_message=message,
+            message_type="twitter_card",
+            details=post.information_text,
+            transcript=post.transcript,
+        )
+        return True
+    except (
+        discord.Forbidden,
+        discord.HTTPException,
+        sqlite3.Error,
+        LookupError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        logger.warning("Twitter/X card could not be sent (%s); using rewrite fallback", type(exc).__name__)
+        if sent is not None:
+            await _delete_message_silently(sent)
+        return False
+
+
+async def _send_legacy_twitter_link(
+    *,
+    message: discord.Message,
+    rewritten_url: str,
+    spoiler: bool,
+    should_emulate: bool,
+    ownership_recorder: OwnershipRecorder,
+) -> bool:
+    view = MessageControlView(timeout=604800)
+    view.original_author_id = message.author.id
+    sent: discord.Message | None = None
+    try:
+        if spoiler:
+            embed = discord.Embed(
+                title="Spoiler Embed",
+                description="This post is hidden behind a spoiler. Click to reveal.",
+                color=0x1DA1F2,
+            )
+            embed.add_field(name="Link", value=rewritten_url, inline=False)
+            sent = await message.channel.send(content="||spoiler||", embed=embed, view=view)
+        else:
+            sent = await _send_with_optional_emulation(
+                message=message,
+                content=rewritten_url,
+                view=view,
+                emulate=should_emulate,
+            )
+        view.message = sent
+        await _record_ownership(
+            ownership_recorder,
+            sent,
+            source_message=message,
+            message_type="twitter_spoiler" if spoiler else "twitter",
+        )
+        return True
+    except (
+        discord.Forbidden,
+        discord.HTTPException,
+        sqlite3.Error,
+        LookupError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        logger.warning("Twitter/X rewrite fallback failed (%s)", type(exc).__name__)
+        if sent is not None:
+            await _delete_message_silently(sent)
+        return False
 
 
 async def _send_with_optional_emulation(
@@ -156,6 +244,8 @@ async def _record_ownership(
     *,
     source_message: discord.Message,
     message_type: str,
+    details: str | None = None,
+    transcript: str | None = None,
 ) -> None:
     message_id = getattr(sent_message, "id", None)
     channel_id = getattr(getattr(sent_message, "channel", None), "id", None)
@@ -167,12 +257,24 @@ async def _record_ownership(
     author_id = getattr(getattr(source_message, "author", None), "id", None)
     if not all(isinstance(value, int) and value > 0 for value in (message_id, channel_id, author_id)):
         raise ValueError("Discord did not return trusted message ownership coordinates")
-    result = recorder(
-        message_id=message_id,
-        channel_id=channel_id,
-        guild_id=guild_id,
-        original_author_id=author_id,
-        message_type=message_type,
-    )
+    values = {
+        "message_id": message_id,
+        "channel_id": channel_id,
+        "guild_id": guild_id,
+        "original_author_id": author_id,
+        "message_type": message_type,
+    }
+    if details is not None:
+        values["details"] = details
+    if transcript is not None:
+        values["transcript"] = transcript
+    result = recorder(**values)
     if inspect.isawaitable(result):
         await result
+
+
+async def _delete_message_silently(message: discord.Message) -> None:
+    try:
+        await message.delete()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
