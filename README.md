@@ -170,7 +170,7 @@ The bot supports these environment variables (with defaults):
 * `STATE_DATABASE_PATH` (`embedly_state.sqlite3`)
 * `TWITTER_EMOJI` (defaults to `<:twitter:1544400500290486373>`; invalid or empty values fall back to `𝕏`)
 * `INSTAGRAM_EMOJI` (defaults to `<:instagram:1544047809169195039>`; invalid or empty values fall back to `📸`)
-* `TIKTOK_EMOJI` (defaults to `<:tiktok:1544047807596597248>`; invalid or empty values fall back to `🎵`)
+* `TIKTOK_EMOJI` (defaults to `<:tiktok:1544047807596597248>`; invalid or empty values fall back to `:tiktok:`)
 * `YOUTUBE_EMOJI` (optional full Discord custom emoji; invalid or empty values fall back to `▶️`)
 * `OWNERSHIP_RETENTION_DAYS` (`30`; minimum `1`)
 
