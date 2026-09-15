@@ -82,6 +82,70 @@ class MediaProcessingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(deleted)
         self.assertIn("was already deleted", logs.output[0])
 
+    async def test_partial_batch_keeps_original_and_cleans_up_files(self):
+        message = FakeMessage()
+        with tempfile.TemporaryDirectory() as folder:
+            path = write_temp_file(folder, ".mp4", b"video bytes")
+
+            def downloader(url, **kwargs):
+                self.assertFalse(message.deleted)
+                if url == "first":
+                    return DownloadResult(success=True, filepath=path, title="Video")
+                return DownloadResult(success=False, error="Download failed")
+
+            with self.assertLogs("handlers.media", level="ERROR"):
+                processed = await process_media_links(
+                    message=message,
+                    urls=["first", "second"],
+                    source_name="TikTok",
+                    icon="TT",
+                    url_validator=lambda url: url,
+                    downloader=downloader,
+                    compressor=lambda *args, **kwargs: None,
+                    view_factory=lambda url: SimpleNamespace(original_author_id=None, message=None),
+                    semaphore=asyncio.Semaphore(1),
+                    config=media_config(upload_limit_bytes=1024),
+                )
+
+            self.assertEqual(processed, 1)
+            self.assertFalse(message.deleted)
+            self.assertFalse(os.path.exists(path))
+
+    async def test_failed_upload_keeps_original_and_cleans_up_files(self):
+        message = FakeMessage()
+        processing_message = FakeSentMessage()
+        error = discord.HTTPException(SimpleNamespace(status=500, reason="Upload failed"), "Upload failed")
+
+        async def send(*args, **kwargs):
+            if "file" in kwargs:
+                # Discord closes its File wrapper even when the HTTP upload fails.
+                kwargs["file"].close()
+                raise error
+            return processing_message
+
+        message.channel.send = AsyncMock(side_effect=send)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = write_temp_file(folder, ".mp4", b"video bytes")
+            with self.assertLogs("handlers.media", level="ERROR"):
+                processed = await process_media_links(
+                    message=message,
+                    urls=["https://youtu.be/abc123"],
+                    source_name="YouTube",
+                    icon="YT",
+                    url_validator=lambda url: url,
+                    downloader=lambda *args, **kwargs: DownloadResult(success=True, filepath=path, title="Video"),
+                    compressor=lambda *args, **kwargs: None,
+                    view_factory=lambda url: SimpleNamespace(original_author_id=None, message=None),
+                    semaphore=asyncio.Semaphore(1),
+                    config=media_config(upload_limit_bytes=1024),
+                )
+
+            self.assertEqual(processed, 0)
+            self.assertFalse(message.deleted)
+            self.assertTrue(processing_message.deleted)
+            self.assertFalse(os.path.exists(path))
+
     async def test_instagram_image_uploads_with_image_label(self):
         with tempfile.TemporaryDirectory() as folder:
             path = write_temp_file(folder, ".jpg", b"image bytes")
@@ -114,7 +178,8 @@ class MediaProcessingTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(processed, 1)
-            self.assertTrue(message.deleted)
+            # Only the event handler can decide whether the whole post was replaced.
+            self.assertFalse(message.deleted)
             self.assertEqual(views[0].original_author_id, message.author.id)
             upload = message.channel.sent[1]["kwargs"]
             self.assertIn("Instagram image shared", upload["content"])

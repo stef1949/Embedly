@@ -87,6 +87,7 @@ async def process_media_links(
     default_media_label: str = "video",
     ownership_recorder: OwnershipRecorder | None = None,
 ) -> int:
+    """Return the number of uploaded replacements; the caller owns source deletion."""
     processed = 0
     for source_url in urls:
         validated_url = url_validator(source_url)
@@ -178,7 +179,6 @@ async def process_media_links(
                     continue
 
             processed += 1
-            await maybe_delete_original_message(message, source_name)
         except asyncio.TimeoutError:
             logger.error("%s operation timed out for URL: %s", source_name, validated_url)
         except (discord.HTTPException, discord.Forbidden, OSError) as exc:

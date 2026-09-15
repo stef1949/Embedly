@@ -11,6 +11,7 @@ This Discord bot replaces supported social links with native Discord Components 
 * **Native social cards:** Twitter/X, TikTok, Instagram, and YouTube use Discord Components V2 containers with creator attribution, original-post and Embedly links, compact engagement data when available, information controls, and transcript controls
 * **Attachment-backed media:** TikTok, Instagram, and YouTube downloads are uploaded once and referenced by the card's native Media Gallery
 * **Twitter/X fallback:** Native Twitter/X link cards retain the validated `vxtwitter.com` rewrite/webhook path as a fallback
+* **Safe Original Deletion:** Deletes the original post only after every detected supported link has a successful replacement and its ownership has been saved. Failed or partially completed posts remain available.
 * **User Emulation:** Can post links either as the original user (with their name and avatar) or as the bot with attribution
 * **Interactive Buttons:**
    * **Information / Transcript:** Native cards return trusted post details and available captions ephemerally
@@ -185,7 +186,7 @@ When you share a supported social link in a channel where the bot is active:
 * The information button shows validated metadata that is available, such as description, post date, duration, and dimensions
 * `/media_details enable:true` adds an inline date/duration/dimensions summary to Instagram and YouTube cards when those values are available; the information button remains available either way
 * TikTok, Instagram, and YouTube request an existing subtitle/caption track from yt-dlp. Embedly does not use speech-to-text, a paid cloud API, bundled speech models, or automatic model downloads. Twitter/X has no transcript source in its link-only path. Missing captions produce `Transcript unavailable for this post`
-* Native cards are sent as replies with `mention_author=False`, so Discord can retain the reply reference and show its original-message-deleted indicator
+* Bot-authored native cards are sent as replies with `mention_author=False`, so Discord can retain the reply reference and show its original-message-deleted indicator. Emulated Twitter/X cards use a webhook with your name and avatar; webhook posts do not include a reply reference
 * When one source message contains several supported links, all replacements are sent and recorded before the source is deleted once. This avoids duplicate deletion attempts and preserves the source if any replacement cannot be secured
 * Native Components V2 sends never mix `view=` with legacy `content=` or `embed=`. Legacy fields are used only by a fallback path
 * Ownership recording uses Discord-issued message, channel, guild, and user IDs. If persistence fails, Embedly removes the unrecorded replacement when possible and preserves the source rather than inferring ownership from text, mentions, URLs, or handles
@@ -245,9 +246,11 @@ export USE_NVIDIA_GPU=true
 **Note:** If hardware encoding fails (e.g., GPU not available or FFmpeg lacks NVENC support), the bot will fall back to CPU-based encoding. Check the bot logs for encoding status messages.
 
 ### User Emulation
-Native Twitter/X Components V2 cards are sent as bot replies so they retain the source-message reference and trusted ownership flow. If native card creation fails, the existing Twitter/X rewrite fallback can still post in two ways:
-* **Emulation Enabled:** Fallback posts appear to come from you (with your name and avatar)
-* **Emulation Disabled:** Fallback posts come from the bot with a mention of who shared the link
+The preference applies to both native Twitter/X cards and their rewrite fallback:
+* **Emulation Enabled:** Posts use your name and avatar through a webhook
+* **Emulation Disabled:** Native cards appear as bot replies; fallback links include attribution
+
+Both paths save trusted ownership before the original post is deleted.
 
 You can toggle your preference with:
 * The `/emulate` command
@@ -258,7 +261,7 @@ You can toggle your preference with:
 ### Managing Posts
 Native cards include information and transcript controls. Legacy fallback views retain these owner-authorized controls:
 * **Delete:** Removes the fallback post (only works for your own posts or if you're an admin)
-* **Toggle Emulation:** Switches your preference for future Twitter/X fallback posts
+* **Toggle Emulation:** Switches your preference for future Twitter/X posts
 
 ### Server Administration
 Server administrators can:

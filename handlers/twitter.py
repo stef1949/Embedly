@@ -39,6 +39,7 @@ async def send_twitter_rewrite_message(
             rewritten_url=rewritten_url,
             spoiler=spoiler,
             icon=icon,
+            should_emulate=should_emulate,
             ownership_recorder=ownership_recorder,
         )
         if native_sent:
@@ -64,6 +65,7 @@ async def _send_native_twitter_card(
     rewritten_url: str,
     spoiler: bool,
     icon: str,
+    should_emulate: bool,
     ownership_recorder: OwnershipRecorder,
 ) -> bool:
     sent: discord.Message | None = None
@@ -71,10 +73,8 @@ async def _send_native_twitter_card(
         post = extract_twitter_post(rewritten_url)
         view = TwitterCardView(post=post, icon=icon, spoiler=spoiler, timeout=604800)
         view.original_author_id = message.author.id
-        sent = await message.reply(
-            view=view,
-            mention_author=False,
-            allowed_mentions=NO_MENTIONS,
+        sent = await _send_with_optional_emulation(
+            message=message, content=None, view=view, emulate=should_emulate,
         )
         view.message = sent
         await _record_ownership(
@@ -156,8 +156,8 @@ async def _send_legacy_twitter_link(
 async def _send_with_optional_emulation(
     *,
     message: discord.Message,
-    content: str,
-    view: discord.ui.View,
+    content: str | None,
+    view: discord.ui.View | discord.ui.LayoutView,
     emulate: bool,
 ) -> discord.Message:
     if emulate and isinstance(message.channel, discord.TextChannel):
@@ -166,17 +166,22 @@ async def _send_with_optional_emulation(
             try:
                 webhook = await _get_or_create_channel_webhook(message.channel, bot_user=message.guild.me)
                 if webhook:
+                    # Components V2 cards must be sent without legacy content.
+                    content_kwargs = {"content": content} if content is not None else {}
                     sent = await webhook.send(
-                        content=content,
+                        **content_kwargs,
                         username=message.author.display_name,
                         avatar_url=message.author.display_avatar.url,
                         view=view,
                         wait=True,
                     )
                     return sent
-            except discord.HTTPException as exc:
+            except (discord.HTTPException, ValueError) as exc:
                 logger.warning("Webhook send failed for %s: %s", message.id, exc)
                 _webhook_cache.pop(message.channel.id, None)
+
+    if content is None:
+        return await message.reply(view=view, mention_author=False, allowed_mentions=NO_MENTIONS)
 
     user_id_mention = f"<@{message.author.id}>"
     return await message.channel.send(f"**Link shared by {user_id_mention}:**\n{content}", view=view)

@@ -290,7 +290,7 @@ async def help_command(interaction: discord.Interaction):
         "**Commands:**\n"
         "`/status` - Check bot status and statistics.\n"
         "`/help` - Show this help message.\n"
-        "`/emulate` - Choose whether Twitter/X fallback links post as you or as the bot.\n"
+        "`/emulate` - Choose whether Twitter/X posts use your name and avatar or the bot's identity.\n"
         "`/media_details` - Add available date, duration, and dimensions to Instagram/YouTube cards.\n\n"
         "**Post Controls:**\n"
         "- Native cards include private `Information` and `Transcript` controls\n"
@@ -304,9 +304,9 @@ async def help_command(interaction: discord.Interaction):
         logger.error(f"Error responding to help command: {e}")
 
 # Slash command: /emulate
-@tree.command(name="emulate", description="Choose identity emulation for Twitter/X fallback links")
+@tree.command(name="emulate", description="Choose identity emulation for Twitter/X posts")
 async def emulate(interaction: discord.Interaction, enable: bool):
-    """Set whether Twitter/X fallback links should post as you or as the bot.
+    """Set whether Twitter/X posts should post as you or as the bot.
     
     Parameters:
     -----------
@@ -328,12 +328,12 @@ async def emulate(interaction: discord.Interaction, enable: bool):
     
     if enable:
         if can_use_webhooks:
-            message = "Twitter/X fallback links will now use your name and avatar."
+            message = "Twitter/X posts will now use your name and avatar."
         else:
-            message = ("The bot will try to post Twitter/X fallback links with your name and avatar. However, it may not work in "
-                       "some channels due to missing webhook permissions. In those cases, it will mention you instead.")
+            message = ("The bot will try to post Twitter/X posts with your name and avatar. However, it may not work in "
+                       "some channels due to missing webhook permissions. In those cases, it will post as the bot with attribution.")
     else:
-        message = "Twitter/X fallback links will now post as the bot and mention you."
+        message = "Twitter/X posts will now post as the bot with attribution."
     
     try:
         await interaction.followup.send(message, ephemeral=True)
@@ -782,18 +782,25 @@ async def on_message(message):
         logger.warning("Global rate limit exceeded, ignoring message")
         return
 
-    message_links_expected = 0
-    message_links_replaced = 0
-
     rewrite_result = rewrite_twitter_urls(message.content)
+    tiktok_matches = list(TIKTOK_URL_REGEX.finditer(message.content))
+    instagram_matches = list(INSTAGRAM_URL_REGEX.finditer(message.content))
+    youtube_matches = list(YOUTUBE_URL_REGEX.finditer(message.content))
+    expected_replacements = (
+        len(rewrite_result.rewritten_urls)
+        + len(rewrite_result.spoiler_urls)
+        + len(tiktok_matches)
+        + len(instagram_matches)
+        + len(youtube_matches)
+    )
+    successful_replacements = 0
+
     if rewrite_result.rewritten_urls or rewrite_result.spoiler_urls:
         if not runtime_state.allow_user_action(message.author.id, "twitter", RATE_LIMIT_SECONDS):
             logger.info(f"User {message.author} is rate limited for Twitter/X processing.")
             return
 
         should_emulate = user_emulation_preferences.get(message.author.id, DEFAULT_EMULATION)
-        twitter_expected = len(rewrite_result.rewritten_urls) + len(rewrite_result.spoiler_urls)
-        message_links_expected += twitter_expected
         try:
             twitter_processed = await send_twitter_rewrite_message(
                 message=message,
@@ -803,18 +810,16 @@ async def on_message(message):
                 ownership_recorder=state.record_message_ownership,
             )
             links_processed += twitter_processed
-            message_links_replaced += twitter_processed
+            successful_replacements += twitter_processed
         except Exception as e:
             logger.error(f"Error sending rewritten Twitter/X message for {message.id}: {e}")
 
     # Process TikTok links
-    tiktok_matches = list(TIKTOK_URL_REGEX.finditer(message.content))
     if tiktok_matches:
         if not runtime_state.allow_user_action(message.author.id, "tiktok", RATE_LIMIT_SECONDS):
             logger.info(f"User {message.author} is rate limited for TikTok link.")
             return
         tiktok_urls = [match.group(0) for match in tiktok_matches]
-        message_links_expected += len(tiktok_urls)
         logger.info(f"Processing TikTok links from {message.author} (ID: {message.id}) with URLs: {tiktok_urls}")
         tiktok_processed = await process_tiktok_links(
             message=message,
@@ -830,16 +835,14 @@ async def on_message(message):
             delete_source=False,
         )
         links_processed += tiktok_processed
-        message_links_replaced += tiktok_processed
+        successful_replacements += tiktok_processed
 
     # Process Instagram links
-    instagram_matches = list(INSTAGRAM_URL_REGEX.finditer(message.content))
     if instagram_matches:
         if not runtime_state.allow_user_action(message.author.id, "instagram", RATE_LIMIT_SECONDS):
             logger.info(f"User {message.author} is rate limited for Instagram link.")
             return
         instagram_urls = [match.group(0) for match in instagram_matches]
-        message_links_expected += len(instagram_urls)
         logger.info(f"Processing Instagram links from {message.author} (ID: {message.id}) with URLs: {instagram_urls}")
         instagram_processed = await process_native_media_links(
             message=message,
@@ -861,16 +864,14 @@ async def on_message(message):
             delete_source=False,
         )
         links_processed += instagram_processed
-        message_links_replaced += instagram_processed
+        successful_replacements += instagram_processed
 
     # Process YouTube links
-    youtube_matches = list(YOUTUBE_URL_REGEX.finditer(message.content))
     if youtube_matches:
         if not runtime_state.allow_user_action(message.author.id, "youtube", RATE_LIMIT_SECONDS):
             logger.info(f"User {message.author} is rate limited for YouTube link.")
             return
         youtube_urls = [match.group(0) for match in youtube_matches]
-        message_links_expected += len(youtube_urls)
         logger.info(f"Processing YouTube links from {message.author} (ID: {message.id}) with URLs: {youtube_urls}")
         youtube_processed = await process_native_media_links(
             message=message,
@@ -891,10 +892,12 @@ async def on_message(message):
             delete_source=False,
         )
         links_processed += youtube_processed
-        message_links_replaced += youtube_processed
+        successful_replacements += youtube_processed
 
-    if message_links_expected and message_links_replaced == message_links_expected:
+    # Delete once, after every supported link has been sent and ownership saved.
+    if expected_replacements > 0 and successful_replacements == expected_replacements:
         await maybe_delete_original_message(message, "social media")
 
 # Run the bot
-client.run(TOKEN)
+if __name__ == "__main__":
+    client.run(TOKEN)
