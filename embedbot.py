@@ -32,6 +32,7 @@ from tiktok_handler import download_tiktok_video, resolve_tiktok_icon
 from utils.urls import (
     extract_supported_links,
     parse_supported_url,
+    contains_unhandled_youtube_link,
     RewriteResult,
 )
 from views import (
@@ -85,7 +86,7 @@ user_media_details_preferences = {}  # Maps user ID to boolean preference
 # Bot statistics
 bot_start_time = time.time()
 links_processed = 0
-version = "2.2.0"  # Bot version
+version = "2.2.1"  # Bot version
 
 # Security settings
 GLOBAL_RATE_LIMIT = CONFIG.global_rate_limit_per_minute  # Maximum requests per minute across all users
@@ -271,7 +272,7 @@ async def help_command(interaction: discord.Interaction):
         emulation_note = "\n⚠️ **Note:** User emulation requires webhook permissions, which the bot doesn't have in this channel."
     
     help_text = (
-        "This bot replaces Twitter/X, TikTok, Instagram, and YouTube links with native Discord cards.\n\n"
+        "This bot replaces Twitter/X, TikTok, Instagram, and YouTube Shorts links with native Discord cards.\n\n"
         "**Commands:**\n"
         "`/status` - Check bot status and statistics.\n"
         "`/help` - Show this help message.\n"
@@ -820,6 +821,9 @@ async def process_message(message) -> str:
                 logger.warning("Link processing failed (%s); preserving source", type(exc).__name__)
         if completed != len(links):
             return "incomplete"
+        if contains_unhandled_youtube_link(message.content):
+            outcome = "published_source_retained"
+            return outcome
         # Do not remove new text/links that arrived while downloads were running.
         try:
             current = await asyncio.wait_for(message.channel.fetch_message(message.id), 30)
@@ -874,7 +878,7 @@ async def download_links_privately(interaction: discord.Interaction, message: di
     finally:
         text = {
             "complete": "Your media replacements have been published.",
-            "published_source_retained": "Your media replacements were published. Your original message was preserved because it changed or could not be checked.",
+            "published_source_retained": "Your media replacements were published. Your original message and embeds were preserved.",
             "busy": "Your message is already being processed. Its original will be preserved unless every replacement succeeds.",
             "no_links": "No supported media links were found. Your original message was preserved.",
             "ignored": "Downloads are disabled here or unavailable for this message.",

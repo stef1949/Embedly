@@ -26,7 +26,7 @@ URLS = {
     'twitter': 'https://x.com/user/status/123',
     'tiktok': 'https://www.tiktok.com/@user/video/123',
     'instagram': 'https://www.instagram.com/p/abc123/',
-    'youtube': 'https://www.youtube.com/watch?v=abc123',
+    'youtube': 'https://www.youtube.com/shorts/abc123',
 }
 
 

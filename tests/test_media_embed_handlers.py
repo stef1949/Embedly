@@ -10,11 +10,11 @@ class MediaEmbedHandlerTests(unittest.TestCase):
     def test_youtube_download_requests_available_captions(self):
         expected = DownloadResult(success=False, error="test")
         with patch("youtube_handler.download_video", return_value=expected) as download_video:
-            result = download_youtube_video("https://www.youtube.com/watch?v=abc123")
+            result = download_youtube_video("https://www.youtube.com/shorts/abc123")
 
         self.assertIs(result, expected)
         download_video.assert_called_once_with(
-            "https://www.youtube.com/watch?v=abc123",
+            "https://www.youtube.com/shorts/abc123",
             output_folder=None,
             download_subtitles=True,
         )

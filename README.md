@@ -3,13 +3,13 @@
   <h1>Embedly Bot</h1>
 </div>
 
-This Discord bot replaces supported social links with native Discord Components V2 cards. It downloads and validates Twitter/X, TikTok, Instagram, and YouTube media before publishing attachment-backed Media Galleries. It includes interactive post details, caption-backed transcripts where available, restart-safe authorization, legacy controls, and comprehensive admin commands.
+This Discord bot replaces supported social links with native Discord Components V2 cards. It downloads and validates Twitter/X, TikTok, Instagram, and YouTube Shorts media before publishing attachment-backed Media Galleries. It includes interactive post details, caption-backed transcripts where available, restart-safe authorization, legacy controls, and comprehensive admin commands.
 
 ## Features
 
 ### Core Functionality
-* **Native social cards:** Twitter/X, TikTok, Instagram, and YouTube use Discord Components V2 containers with creator attribution, original-post and Embedly links, compact engagement data when available, information, transcript, and owner-authorized Delete controls
-* **Attachment-backed media:** Twitter/X, TikTok, Instagram, and YouTube downloads are uploaded once and referenced by the card's native Media Gallery
+* **Native social cards:** Twitter/X, TikTok, Instagram, and YouTube Shorts use Discord Components V2 containers with creator attribution, original-post and Embedly links, compact engagement data when available, information, transcript, and owner-authorized Delete controls
+* **Attachment-backed media:** Twitter/X, TikTok, Instagram, and YouTube Shorts downloads are uploaded once and referenced by the card's native Media Gallery
 * **Fail-closed publication:** Failed downloads, invalid media, timeouts, and rejected uploads never generate fallback links or public errors
 * **Safe Original Deletion:** Deletes the original post only after every detected supported link has a successful replacement and its ownership has been saved. Failed or partially completed posts remain available.
 * **User Emulation:** Can post media cards either as the original user (with their name and avatar) or as the bot with attribution
@@ -46,7 +46,7 @@ This Discord bot replaces supported social links with native Discord Components 
 ## Prerequisites
 * Python 3.10+
 * discord.py 2.7.1+ (Components V2 support; the dependency is constrained to `<3`)
-* yt-dlp (for TikTok, Instagram, and YouTube media downloads)
+* yt-dlp (for TikTok, Instagram, and YouTube Shorts media downloads)
 * FFmpeg (for video processing)
 * A Discord bot token
 * *Optional:* NVIDIA GPU with NVENC support for hardware-accelerated video encoding
@@ -219,20 +219,13 @@ When you share an Instagram link (posts, reels, IGTV) in a channel where the bot
 
 **Note:** Media larger than 8MB cannot be uploaded due to Discord's file size limits. Videos may be compressed before upload; images are uploaded as downloaded.
 
-### YouTube Video Downloads
-When you share a YouTube link in a channel where the bot is active:
-* The bot automatically downloads the video using yt-dlp
-* The video is uploaded directly to Discord and referenced by the native card's Media Gallery
-* Available views, likes, comments, creator data, date, duration, size, and captions are presented by the card
-* A failed download/card safely falls back to the validated YouTube link
+### YouTube Shorts Downloads
+Only explicit `https://www.youtube.com/shorts/...` links are processed. The `youtube.com` and `m.youtube.com` variants, query parameters, and trailing slashes are supported.
 
-**Supported YouTube URL formats:**
-* Videos: `https://www.youtube.com/watch?v=...`
-* Shorts: `https://www.youtube.com/shorts/...`
-* Live videos: `https://www.youtube.com/live/...`
-* Short links: `https://youtu.be/...`
-
-**Note:** Videos larger than 8MB cannot be uploaded due to Discord's file size limits.
+* Shorts are downloaded, validated, and uploaded as native media cards with available metadata and captions.
+* Regular watch links, `youtu.be` links, livestreams, embedded videos, and playlists are left untouched. This includes Shorts shared using an ambiguous watch or `youtu.be` URL; use the explicit `/shorts/` URL to enable processing.
+* If a message mixes a regular YouTube link with Shorts or other supported links, replacements may be published, but the original message and **all** of its embeds are preserved regardless of the delete/suppress setting.
+* Failed downloads or publication preserve the source without fallback links or public error messages.
 
 ### Hardware-Accelerated Video Encoding
 The bot supports NVIDIA GPU hardware acceleration for video encoding using NVENC. This feature can significantly improve video processing performance when enabled.

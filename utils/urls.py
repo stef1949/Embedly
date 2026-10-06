@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 TWITTER_HOSTS = {"twitter.com", "www.twitter.com", "mobile.twitter.com", "x.com", "www.x.com", "mobile.x.com"}
 TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}
@@ -101,7 +101,6 @@ def parse_supported_url(url: str, spoiler: bool = False) -> SupportedLink:
     if parsed.scheme.lower() not in {"http", "https"} or parsed.username or parsed.password or parsed.port:
         raise ValueError("Unsupported source URL")
     path = parsed.path.rstrip("/")
-    query = parse_qs(parsed.query)
     if host in TWITTER_HOSTS or host in {"vxtwitter.com", "www.vxtwitter.com"}:
         match = re.fullmatch(r"/([\w]+)/status/(\d+)(?:/(?:photo|video)/\d+)?", path)
         if not match:
@@ -112,18 +111,10 @@ def parse_supported_url(url: str, spoiler: bool = False) -> SupportedLink:
     elif host in INSTAGRAM_HOSTS and any(p.fullmatch(parsed.path) for p in _INSTAGRAM_PATHS):
         platform, url = "instagram", f"https://www.instagram.com{path}/"
     elif host in YOUTUBE_HOSTS:
-        video_id = None
-        if host in {"youtu.be", "www.youtu.be"}:
-            video_id = path.lstrip("/")
-        elif path == "/watch":
-            video_id = query.get("v", [None])[0]
-        else:
-            match = re.fullmatch(r"/(?:shorts|live|embed|v)/([\w-]+)", path)
-            if match:
-                video_id = match[1]
-        if not video_id or not re.fullmatch(r"[\w-]+", video_id):
-            raise ValueError("Expected a YouTube video")
-        platform, url = "youtube", f"https://www.youtube.com/watch?v={video_id}"
+        match = re.fullmatch(r"/shorts/([A-Za-z0-9_-]+)", path)
+        if host not in {"youtube.com", "www.youtube.com", "m.youtube.com"} or not match:
+            raise ValueError("Only explicit YouTube Shorts links are supported")
+        platform, url = "youtube", f"https://www.youtube.com/shorts/{match[1]}"
     else:
         raise ValueError("Unsupported source URL")
     return SupportedLink(platform, url, spoiler)
@@ -141,6 +132,25 @@ def extract_supported_links(content: str) -> list[SupportedLink]:
         # If any occurrence is hidden, keep the replacement hidden too.
         links[key] = SupportedLink(link.platform, link.url, link.spoiler or bool(previous and previous.spoiler))
     return list(links.values())
+
+
+def contains_unhandled_youtube_link(content: str) -> bool:
+    """Protect the whole source: Discord suppression affects every embed in it."""
+    for match in URL_REGEX.finditer(content):
+        try:
+            host = _normalize_host(urlsplit(_strip_trailing_punctuation(match[0])).hostname)
+        except ValueError:
+            continue
+        youtube_host = any(host == root or host.endswith("." + root)
+                           for root in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
+        if youtube_host:
+            try:
+                if parse_supported_url(match[0]).platform == "youtube":
+                    continue
+            except ValueError:
+                pass
+            return True
+    return False
 
 
 def validate_tiktok_url(url: str) -> str:

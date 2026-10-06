@@ -142,7 +142,7 @@ class MessageReplacementTests(WorkflowFixture, unittest.IsolatedAsyncioTestCase)
         message.delete.assert_awaited_once()
 
     async def test_duplicates_tracking_parameters_and_adjacent_links(self):
-        message = self.message(f"<{URLS['instagram']}?utm_source=a><{URLS['instagram']}> {URLS['youtube']}&feature=share")
+        message = self.message(f"<{URLS['instagram']}?utm_source=a><{URLS['instagram']}> {URLS['youtube']}?feature=share")
         await embedbot.on_message(message)
         self.assertEqual(message.reply.await_count, 2)
         message.delete.assert_awaited_once()
