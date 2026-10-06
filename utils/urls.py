@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 TWITTER_HOSTS = {"twitter.com", "www.twitter.com", "mobile.twitter.com", "x.com", "www.x.com", "mobile.x.com"}
-TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "vm.tiktok.com"}
+TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}
 INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com", "instagr.am", "www.instagr.am"}
 YOUTUBE_HOSTS = {
     "youtube.com",
@@ -16,7 +16,7 @@ YOUTUBE_HOSTS = {
     "www.youtu.be",
 }
 
-URL_REGEX = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
+URL_REGEX = re.compile(r"https?://[^\s<>()\[\]{}|\"`]+", re.IGNORECASE)
 TRAILING_PUNCTUATION = ".,!?;:)]}"
 
 _TIKTOK_PATHS = (
@@ -67,7 +67,10 @@ def rewrite_twitter_urls(content: str) -> RewriteResult:
     spoiler: list[str] = []
     for match in URL_REGEX.finditer(content):
         raw_url = _strip_trailing_punctuation(match.group(0))
-        parsed = urlsplit(raw_url)
+        try:
+            parsed = urlsplit(raw_url)
+        except ValueError:
+            continue
         host = _normalize_host(parsed.hostname)
         if host in {"vxtwitter.com", "www.vxtwitter.com"}:
             continue
@@ -82,6 +85,62 @@ def rewrite_twitter_urls(content: str) -> RewriteResult:
         else:
             rewritten.append(replaced)
     return RewriteResult(rewritten_urls=rewritten, spoiler_urls=spoiler)
+
+
+@dataclass(frozen=True)
+class SupportedLink:
+    platform: str
+    url: str
+    spoiler: bool = False
+
+
+def parse_supported_url(url: str, spoiler: bool = False) -> SupportedLink:
+    """Strict validation for downloads; metadata/creator URL helpers are separate."""
+    parsed = urlsplit(_strip_trailing_punctuation(url))
+    host = _normalize_host(parsed.hostname)
+    if parsed.scheme.lower() not in {"http", "https"} or parsed.username or parsed.password or parsed.port:
+        raise ValueError("Unsupported source URL")
+    path = parsed.path.rstrip("/")
+    query = parse_qs(parsed.query)
+    if host in TWITTER_HOSTS or host in {"vxtwitter.com", "www.vxtwitter.com"}:
+        match = re.fullmatch(r"/([\w]+)/status/(\d+)(?:/(?:photo|video)/\d+)?", path)
+        if not match:
+            raise ValueError("Expected a Twitter/X post")
+        platform, url = "twitter", f"https://x.com/{match[1]}/status/{match[2]}"
+    elif host in TIKTOK_HOSTS and any(p.fullmatch(parsed.path) for p in _TIKTOK_PATHS):
+        platform, url = "tiktok", urlunsplit(("https", host, path, "", ""))
+    elif host in INSTAGRAM_HOSTS and any(p.fullmatch(parsed.path) for p in _INSTAGRAM_PATHS):
+        platform, url = "instagram", f"https://www.instagram.com{path}/"
+    elif host in YOUTUBE_HOSTS:
+        video_id = None
+        if host in {"youtu.be", "www.youtu.be"}:
+            video_id = path.lstrip("/")
+        elif path == "/watch":
+            video_id = query.get("v", [None])[0]
+        else:
+            match = re.fullmatch(r"/(?:shorts|live|embed|v)/([\w-]+)", path)
+            if match:
+                video_id = match[1]
+        if not video_id or not re.fullmatch(r"[\w-]+", video_id):
+            raise ValueError("Expected a YouTube video")
+        platform, url = "youtube", f"https://www.youtube.com/watch?v={video_id}"
+    else:
+        raise ValueError("Unsupported source URL")
+    return SupportedLink(platform, url, spoiler)
+
+
+def extract_supported_links(content: str) -> list[SupportedLink]:
+    links: dict[tuple[str, str], SupportedLink] = {}
+    for match in URL_REGEX.finditer(content):
+        try:
+            link = parse_supported_url(match[0], _is_spoiler(content, match.start(), match.end()))
+        except ValueError:
+            continue
+        key = (link.platform, link.url)
+        previous = links.get(key)
+        # If any occurrence is hidden, keep the replacement hidden too.
+        links[key] = SupportedLink(link.platform, link.url, link.spoiler or bool(previous and previous.spoiler))
+    return list(links.values())
 
 
 def validate_tiktok_url(url: str) -> str:

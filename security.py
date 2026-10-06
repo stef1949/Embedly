@@ -33,7 +33,8 @@ def can_manage_bot_message(
     is_server_owner = bool(guild and guild.owner_id == user_id)
     is_server_admin = False
     if guild:
-        member = guild.get_member(user_id)
+        # Component interactions carry a Member even when the member cache is empty.
+        member = interaction.user if isinstance(interaction.user, discord.Member) else guild.get_member(user_id)
         if member:
             is_server_admin = member.guild_permissions.administrator
 

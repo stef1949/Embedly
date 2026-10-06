@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import asyncio
 from dataclasses import dataclass, field
 
 
@@ -8,6 +9,8 @@ from dataclasses import dataclass, field
 class RuntimeState:
     user_rate_limit: dict[tuple[int, str], float] = field(default_factory=dict)
     global_request_timestamps: list[float] = field(default_factory=list)
+    active_sources: set[int] = field(default_factory=set)
+    active_jobs: dict[int, asyncio.Future] = field(default_factory=dict)
 
     def allow_global_request(self, per_minute_limit: int, now: float | None = None) -> bool:
         now = now or time.time()

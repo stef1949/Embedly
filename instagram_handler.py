@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import tempfile
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
@@ -14,7 +13,7 @@ from urllib.request import Request, urlopen
 
 import discord
 
-from services.downloaders import DownloadResult, download_media
+from services.downloaders import DownloadResult, download_media, MAX_DOWNLOAD_BYTES
 from services.media_embeds import build_media_metadata_embed
 
 INSTAGRAM_COLOR = 0xE4405F
@@ -159,7 +158,9 @@ def _metadata_page_urls(media_url: str) -> list[str]:
 def _fetch_html(url: str) -> str:
     request = Request(url, headers=REQUEST_HEADERS)
     with urlopen(request, timeout=30) as response:
-        payload = response.read()
+        payload = response.read(4 * 1024 * 1024 + 1)
+        if len(payload) > 4 * 1024 * 1024:
+            raise ValueError("Metadata page exceeds size budget")
         charset = response.headers.get_content_charset() or "utf-8"
     return payload.decode(charset, errors="replace")
 
@@ -200,8 +201,17 @@ def _download_image_file(
         content_type = response.headers.get_content_type().lower()
         extension = _image_extension(image_url, content_type)
         handle, filepath = tempfile.mkstemp(prefix=f"{filename_prefix}_", suffix=f".{extension}", dir=output_folder)
-        with os.fdopen(handle, "wb") as output_file:
-            shutil.copyfileobj(response, output_file)
+        try:
+            with os.fdopen(handle, "wb") as output_file:
+                total = 0
+                while chunk := response.read(65536):
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        raise ValueError("Image exceeds download budget")
+                    output_file.write(chunk)
+        except BaseException:
+            os.unlink(filepath)
+            raise
     return filepath, content_type
 
 

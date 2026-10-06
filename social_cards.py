@@ -15,6 +15,7 @@ from tiktok_handler import (
     _non_negative_number,
     _truncate,
     escape_discord_text,
+    downloaded_title,
     format_compact_number,
 )
 from utils.urls import (
@@ -55,6 +56,7 @@ class SocialPost:
     height: int | None
     engagement: tuple[tuple[str, int], ...]
     transcript: str | None
+    title: str | None = None
 
     @property
     def creator_display(self) -> str:
@@ -182,6 +184,17 @@ def extract_youtube_post(result: DownloadResult, validated_url: str) -> SocialPo
     )
 
 
+def extract_twitter_media_post(result: DownloadResult, url: str) -> SocialPost:
+    base = extract_twitter_post(url)
+    return _media_post(
+        result=result, metadata=result.metadata, platform_key="twitter", platform_name="Twitter/X",
+        open_label="Open on X", accent_colour=TWITTER_COLOR,
+        display_name=_first_text(result.metadata, ("uploader", "creator"), 80) or base.display_name,
+        handle=base.handle, creator_url=base.creator_url, original_url=base.original_url,
+        engagement_fields=(("♥", ("like_count",)), ("💬", ("comment_count",)), ("🔁", ("repost_count",))),
+    )
+
+
 def extract_twitter_post(rewritten_url: str) -> SocialPost:
     parsed = urlsplit(rewritten_url)
     host = (parsed.hostname or "").casefold().strip(".")
@@ -268,6 +281,7 @@ def _media_post(
         height=int(height) if height else None,
         engagement=engagement,
         transcript=_extract_transcript(metadata, result.filepath),
+        title=downloaded_title(result),
     )
 
 

@@ -70,6 +70,42 @@ class SQLiteStateStore:
                 )
                 """
             )
+            self._connection.execute("""
+                CREATE TABLE IF NOT EXISTS link_publications (
+                    source_id INTEGER NOT NULL,
+                    link_key TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'published')),
+                    replacement_id INTEGER,
+                    PRIMARY KEY(source_id, link_key)
+                )
+            """)
+
+    def publication_status(self, source_id: int, link_key: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT p.status, o.message_id FROM link_publications p "
+                "LEFT JOIN message_ownership o ON o.message_id=p.replacement_id "
+                "WHERE p.source_id=? AND p.link_key=?",
+                (source_id, link_key),
+            ).fetchone()
+        if row and row[0] == "published" and row[1] is None:
+            return "unowned"
+        return row[0] if row else None
+
+    def claim_publication(self, source_id: int, link_key: str) -> bool:
+        with self._lock:
+            return self._connection.execute(
+                "INSERT OR IGNORE INTO link_publications(source_id,link_key,status) VALUES(?,?,'pending')",
+                (_positive_id(source_id, "source_id"), link_key),
+            ).rowcount == 1
+
+    def abandon_publication(self, source_id: int, link_key: str) -> None:
+        """Only safe after a definitive rejection or confirmed rollback deletion."""
+        with self._lock:
+            self._connection.execute(
+                "DELETE FROM link_publications WHERE source_id=? AND link_key=? AND status='pending'",
+                (source_id, link_key),
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -85,6 +121,8 @@ class SQLiteStateStore:
         message_type: str,
         details: str | None = None,
         transcript: str | None = None,
+        source_id: int | None = None,
+        link_key: str | None = None,
     ) -> None:
         if not _MESSAGE_TYPE_PATTERN.fullmatch(message_type):
             raise ValueError("message_type must be a short lower-case identifier")
@@ -140,6 +178,14 @@ class SQLiteStateStore:
                 )
                 if actual != expected:
                     raise RuntimeError("message ownership record conflicts with existing state")
+                if source_id is not None:
+                    updated = self._connection.execute(
+                        "UPDATE link_publications SET status='published', replacement_id=? "
+                        "WHERE source_id=? AND link_key=? AND status='pending'",
+                        (message_id, source_id, link_key),
+                    )
+                    if updated.rowcount != 1:
+                        raise RuntimeError("Publication claim is missing")
             except Exception:
                 self._connection.execute("ROLLBACK")
                 raise

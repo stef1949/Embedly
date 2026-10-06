@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import re
 import subprocess
 import sys
 import time
@@ -20,6 +19,7 @@ from instagram_handler import download_instagram_media
 from persistence import SQLiteStateStore
 from runtime_state import RuntimeState
 from services.transcode import compress_video_to_limit as compress_video_to_limit_safe
+from services.worker import operation_timeout
 from social_cards import (
     INSTAGRAM_FALLBACK_ICON,
     TWITTER_FALLBACK_ICON,
@@ -30,10 +30,9 @@ from social_cards import (
 )
 from tiktok_handler import download_tiktok_video, resolve_tiktok_icon
 from utils.urls import (
-    rewrite_twitter_urls,
-    validate_instagram_url as validate_instagram_url_safe,
-    validate_tiktok_url as validate_tiktok_url_safe,
-    validate_youtube_url as validate_youtube_url_safe,
+    extract_supported_links,
+    parse_supported_url,
+    RewriteResult,
 )
 from views import (
     InstagramCardView,
@@ -68,20 +67,6 @@ intents.message_content = True
 
 client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
-
-# Regex to match TikTok URLs
-TIKTOK_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com)/\S+)', re.IGNORECASE)
-
-# Regex to match Instagram URLs (posts, reels, stories, and short URLs)
-INSTAGRAM_URL_REGEX = re.compile(r'(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reels?|tv|stories)/\S+)', re.IGNORECASE)
-
-# Regex to match YouTube URLs (videos, shorts, live videos, embeds, and youtu.be links)
-YOUTUBE_URL_REGEX = re.compile(
-    r'(https?://(?:(?:www\.|m\.|music\.)?youtube\.com/(?:'
-    r'watch\?\S*?v=[\w\-]+\S*|shorts/[\w\-]+\S*|live/[\w\-]+\S*|'
-    r'embed/[\w\-]+\S*|v/[\w\-]+\S*)|(?:www\.)?youtu\.be/[\w\-]+\S*))',
-    re.IGNORECASE,
-)
 
 # Rate limiting configuration (per user)
 RATE_LIMIT_SECONDS = CONFIG.rate_limit_seconds
@@ -290,11 +275,12 @@ async def help_command(interaction: discord.Interaction):
         "**Commands:**\n"
         "`/status` - Check bot status and statistics.\n"
         "`/help` - Show this help message.\n"
-        "`/emulate` - Choose whether Twitter/X posts use your name and avatar or the bot's identity.\n"
+        "`/emulate` - Choose whether media cards use your name and avatar or the bot's identity.\n"
         "`/media_details` - Add available date, duration, and dimensions to Instagram/YouTube cards.\n\n"
+        "Use **Apps → Download links** on your own message for private download progress. Automatic processing is silent.\n\n"
         "**Post Controls:**\n"
         "- Native cards include private `Information` and `Transcript` controls\n"
-        "- Legacy fallback posts retain owner-authorized `Delete` and `Toggle Emulation` controls\n\n"
+        "- Media cards include owner-authorized `Delete`; legacy posts also retain `Toggle Emulation`\n\n"
         f"Share a supported link in any enabled channel, and the bot will handle the rest!{emulation_note}"
     )
     
@@ -304,14 +290,14 @@ async def help_command(interaction: discord.Interaction):
         logger.error(f"Error responding to help command: {e}")
 
 # Slash command: /emulate
-@tree.command(name="emulate", description="Choose identity emulation for Twitter/X posts")
+@tree.command(name="emulate", description="Choose whether media cards use your identity or the bot's")
 async def emulate(interaction: discord.Interaction, enable: bool):
-    """Set whether Twitter/X posts should post as you or as the bot.
+    """Set whether media cards should post as you or as the bot.
     
     Parameters:
     -----------
     enable: bool
-        True to have the bot post links with your name and avatar, False to have it post as itself.
+        True to have the bot post cards with your name and avatar, False to have it post as itself.
     """
     logger.info(f"Received /emulate command from {interaction.user} with value {enable}")
     
@@ -328,12 +314,12 @@ async def emulate(interaction: discord.Interaction, enable: bool):
     
     if enable:
         if can_use_webhooks:
-            message = "Twitter/X posts will now use your name and avatar."
+            message = "Media cards will now use your name and avatar when this channel allows it."
         else:
-            message = ("The bot will try to post Twitter/X posts with your name and avatar. However, it may not work in "
+            message = ("The bot will try to post media cards with your name and avatar. However, it may not work in "
                        "some channels due to missing webhook permissions. In those cases, it will post as the bot with attribution.")
     else:
-        message = "Twitter/X posts will now post as the bot with attribution."
+        message = "Media cards will now post as the bot with your attribution."
     
     try:
         await interaction.followup.send(message, ephemeral=True)
@@ -502,10 +488,16 @@ async def server_blacklist(interaction: discord.Interaction, server_id: str, add
 @tree.command(name="server_settings", description="Configure bot settings for this server (requires Manage Server permission)")
 @discord.app_commands.checks.cooldown(1, 5.0)  # 1 use per 5 seconds per user
 @discord.app_commands.checks.has_permissions(manage_guild=True)
+@discord.app_commands.choices(source_behavior=[
+    discord.app_commands.Choice(name="Delete original after all replacements succeed", value="delete"),
+    discord.app_commands.Choice(name="Suppress original embeds after all replacements succeed", value="suppress"),
+    discord.app_commands.Choice(name="Keep original message and embeds", value="keep"),
+])
 async def configure_server(
     interaction: discord.Interaction,
     enable_bot: bool | None = None,
     allowed_channels: bool | None = None,
+    source_behavior: str | None = None,
 ):
     """Configure server-specific settings for the bot"""
     logger.info(f"Received /server_settings command from {interaction.user} in guild {interaction.guild}")
@@ -524,6 +516,12 @@ async def configure_server(
     
     # Update settings if provided
     settings_updated = False
+    if source_behavior is not None:
+        if source_behavior not in {"delete", "suppress", "keep"}:
+            await interaction.response.send_message("Unknown source behavior.", ephemeral=True)
+            return
+        set_server_setting(interaction.guild.id, "source_behavior", source_behavior)
+        settings_updated = True
     if enable_bot is not None:
         set_server_setting(interaction.guild.id, "enabled", enable_bot)
         settings_updated = True
@@ -542,6 +540,7 @@ async def configure_server(
     
     embed.add_field(name="Bot Enabled", value="✅ Yes" if current_settings.get("enabled", True) else "❌ No", inline=True)
     embed.add_field(name="Channel Restriction", value="✅ Enabled" if current_settings.get("restricted_to_channels", False) else "❌ Disabled", inline=True)
+    embed.add_field(name="After successful publication", value=current_settings.get("source_behavior", CONFIG.source_behavior), inline=True)
     
     # Add additional fields for other settings as needed
     
@@ -743,161 +742,149 @@ async def on_ready():
     # Start background tasks
     client.loop.create_task(security_maintenance())
 
+async def process_message(message) -> str:
+    global links_processed
+    if message.author == client.user or getattr(message.author, "bot", False) or getattr(message, "webhook_id", None):
+        return "ignored"
+    if is_user_banned(message.author.id) or (message.guild and is_server_blacklisted(message.guild.id)):
+        return "ignored"
+    if message.guild:
+        if not get_server_setting(message.guild.id, "enabled", True):
+            return "ignored"
+        if get_server_setting(message.guild.id, "restricted_to_channels", False):
+            if message.channel.id not in get_server_setting(message.guild.id, "whitelisted_channels", set()):
+                return "ignored"
+    links = extract_supported_links(message.content)
+    if not links:
+        return "no_links"
+    if message.id in runtime_state.active_sources:
+        return "busy"
+    if not check_global_rate_limit():
+        return "rate_limited"
+    runtime_state.active_sources.add(message.id)
+    completion = asyncio.get_running_loop().create_future()
+    runtime_state.active_jobs[message.id] = completion
+    outcome = "incomplete"
+    try:
+        completed = 0
+        allowed = {}
+        for link in links:
+            status = state.publication_status(message.id, link.url)
+            if status == "published":
+                completed += 1
+                continue
+            if status is not None:
+                continue
+            if link.platform not in allowed:
+                allowed[link.platform] = runtime_state.allow_user_action(message.author.id, link.platform, RATE_LIMIT_SECONDS)
+            if not allowed[link.platform]:
+                continue
+
+            def record(**values):
+                # Ownership and the publication outcome commit in one transaction.
+                state.record_message_ownership(**values, source_id=message.id, link_key=link.url)
+
+            common = dict(
+                message=message, ownership_recorder=record, config=media_config,
+                semaphore=media_semaphore, publication_store=state,
+                should_emulate=user_emulation_preferences.get(message.author.id, DEFAULT_EMULATION),
+            )
+            try:
+                if link.platform == "twitter":
+                    result = await send_twitter_rewrite_message(
+                        rewrite_result=RewriteResult([] if link.spoiler else [link.url], [link.url] if link.spoiler else []),
+                        icon=TWITTER_ICON, **common,
+                    )
+                else:
+                    common.update(
+                        urls=[link.url], url_validator=lambda url: parse_supported_url(url).url,
+                        compressor=compress_video_to_limit_safe, delete_source=False, spoiler=link.spoiler,
+                    )
+                    if link.platform == "tiktok":
+                        result = await process_tiktok_links(downloader=download_tiktok_video, icon=TIKTOK_ICON, **common)
+                    else:
+                        instagram = link.platform == "instagram"
+                        result = await process_native_media_links(
+                            source_name="Instagram" if instagram else "YouTube", platform_key=link.platform,
+                            icon=INSTAGRAM_ICON if instagram else YOUTUBE_ICON,
+                            downloader=download_instagram_media if instagram else download_youtube_video,
+                            post_factory=extract_instagram_post if instagram else extract_youtube_post,
+                            card_view_factory=InstagramCardView if instagram else YouTubeCardView,
+                            include_details=user_media_details_preferences.get(message.author.id, False), **common,
+                        )
+                # Never trust a handler's count without its durable publication record.
+                if result and state.publication_status(message.id, link.url) == "published":
+                    completed += 1
+                    links_processed += 1
+            except Exception as exc:
+                logger.warning("Link processing failed (%s); preserving source", type(exc).__name__)
+        if completed != len(links):
+            return "incomplete"
+        # Do not remove new text/links that arrived while downloads were running.
+        try:
+            current = await asyncio.wait_for(message.channel.fetch_message(message.id), 30)
+        except (discord.HTTPException, asyncio.TimeoutError):
+            outcome = "published_source_retained"
+            return outcome
+        if current.content != message.content or current.author.id != message.author.id:
+            outcome = "published_source_retained"
+            return outcome
+        behavior = get_server_setting(message.guild.id, "source_behavior", CONFIG.source_behavior) if message.guild else CONFIG.source_behavior
+        if behavior == "suppress":
+            try:
+                await asyncio.wait_for(message.edit(suppress=True), 30)
+            except (discord.HTTPException, asyncio.TimeoutError):
+                logger.warning("Could not suppress source embed; source retained")
+        elif behavior == "delete":
+            await maybe_delete_original_message(message, "social media")
+        outcome = "complete"
+        return outcome
+    finally:
+        runtime_state.active_sources.discard(message.id)
+        runtime_state.active_jobs.pop(message.id, None)
+        if not completion.done():
+            completion.set_result(outcome)
+
+
 @client.event
 async def on_message(message):
-    global links_processed  # Declare global at the start of the function
-    # Avoid processing the bot's own messages.
-    
-    if message.author == client.user:
+    try:
+        async with operation_timeout(600):
+            await process_message(message)
+    except Exception as exc:
+        logger.warning("Message processing failed (%s); source retained", type(exc).__name__)
+
+
+@tree.context_menu(name="Download links")
+async def download_links_privately(interaction: discord.Interaction, message: discord.Message):
+    if interaction.user.id != message.author.id:
+        await interaction.response.send_message("Only the submitting user can download this message's links.", ephemeral=True)
         return
-        
-    # Check if the user is banned
-    if is_user_banned(message.author.id):
-        logger.info(f"Ignoring message from banned user {message.author.id}")
-        return
-        
-    # Check if in a blacklisted server
-    if message.guild and is_server_blacklisted(message.guild.id):
-        logger.info(f"Ignoring message from blacklisted server {message.guild.id}")
-        return
-        
-    include_media_details = user_media_details_preferences.get(message.author.id, False)
-
-    # Check server-specific settings
-    if message.guild:
-        # Check if the bot is enabled for this server
-        if not get_server_setting(message.guild.id, "enabled", True):
-            logger.info(f"Bot is disabled in server {message.guild.id}")
-            return
-            
-        # Check if the channel is whitelisted (if channel restriction is enabled)
-        if get_server_setting(message.guild.id, "restricted_to_channels", False):
-            whitelisted_channels = get_server_setting(message.guild.id, "whitelisted_channels", set())
-            if message.channel.id not in whitelisted_channels:
-                logger.info(f"Ignoring message in non-whitelisted channel {message.channel.id}")
-                return
-
-    # Check global rate limit
-    if not check_global_rate_limit():
-        logger.warning("Global rate limit exceeded, ignoring message")
-        return
-
-    rewrite_result = rewrite_twitter_urls(message.content)
-    tiktok_matches = list(TIKTOK_URL_REGEX.finditer(message.content))
-    instagram_matches = list(INSTAGRAM_URL_REGEX.finditer(message.content))
-    youtube_matches = list(YOUTUBE_URL_REGEX.finditer(message.content))
-    expected_replacements = (
-        len(rewrite_result.rewritten_urls)
-        + len(rewrite_result.spoiler_urls)
-        + len(tiktok_matches)
-        + len(instagram_matches)
-        + len(youtube_matches)
-    )
-    successful_replacements = 0
-
-    if rewrite_result.rewritten_urls or rewrite_result.spoiler_urls:
-        if not runtime_state.allow_user_action(message.author.id, "twitter", RATE_LIMIT_SECONDS):
-            logger.info(f"User {message.author} is rate limited for Twitter/X processing.")
-            return
-
-        should_emulate = user_emulation_preferences.get(message.author.id, DEFAULT_EMULATION)
+    await interaction.response.send_message("Your link is being downloaded", ephemeral=True)
+    outcome = "incomplete"
+    try:
+        async with operation_timeout(600):
+            running = runtime_state.active_jobs.get(message.id)
+            if running is not None:
+                outcome = await asyncio.shield(running)
+            else:
+                outcome = await process_message(message)
+    except Exception as exc:
+        logger.warning("Private download failed (%s)", type(exc).__name__)
+    finally:
+        text = {
+            "complete": "Your media replacements have been published.",
+            "published_source_retained": "Your media replacements were published. Your original message was preserved because it changed or could not be checked.",
+            "busy": "Your message is already being processed. Its original will be preserved unless every replacement succeeds.",
+            "no_links": "No supported media links were found. Your original message was preserved.",
+            "ignored": "Downloads are disabled here or unavailable for this message.",
+            "rate_limited": "Please try again later. Your original message was preserved.",
+        }.get(outcome, "Not every replacement could be published. Your original message and embeds were preserved.")
         try:
-            twitter_processed = await send_twitter_rewrite_message(
-                message=message,
-                rewrite_result=rewrite_result,
-                should_emulate=should_emulate,
-                icon=TWITTER_ICON,
-                ownership_recorder=state.record_message_ownership,
-            )
-            links_processed += twitter_processed
-            successful_replacements += twitter_processed
-        except Exception as e:
-            logger.error(f"Error sending rewritten Twitter/X message for {message.id}: {e}")
+            await interaction.edit_original_response(content=text)
+        except discord.HTTPException:
+            logger.warning("Could not resolve private progress response")
 
-    # Process TikTok links
-    if tiktok_matches:
-        if not runtime_state.allow_user_action(message.author.id, "tiktok", RATE_LIMIT_SECONDS):
-            logger.info(f"User {message.author} is rate limited for TikTok link.")
-            return
-        tiktok_urls = [match.group(0) for match in tiktok_matches]
-        logger.info(f"Processing TikTok links from {message.author} (ID: {message.id}) with URLs: {tiktok_urls}")
-        tiktok_processed = await process_tiktok_links(
-            message=message,
-            urls=tiktok_urls,
-            url_validator=validate_tiktok_url_safe,
-            downloader=download_tiktok_video,
-            compressor=compress_video_to_limit_safe,
-            fallback_view_factory=lambda url: TikTokControlView(original_url=url, timeout=604800),
-            ownership_recorder=state.record_message_ownership,
-            semaphore=media_semaphore,
-            config=media_config,
-            icon=TIKTOK_ICON,
-            delete_source=False,
-        )
-        links_processed += tiktok_processed
-        successful_replacements += tiktok_processed
 
-    # Process Instagram links
-    if instagram_matches:
-        if not runtime_state.allow_user_action(message.author.id, "instagram", RATE_LIMIT_SECONDS):
-            logger.info(f"User {message.author} is rate limited for Instagram link.")
-            return
-        instagram_urls = [match.group(0) for match in instagram_matches]
-        logger.info(f"Processing Instagram links from {message.author} (ID: {message.id}) with URLs: {instagram_urls}")
-        instagram_processed = await process_native_media_links(
-            message=message,
-            urls=instagram_urls,
-            source_name="Instagram",
-            platform_key="instagram",
-            icon=INSTAGRAM_ICON,
-            url_validator=validate_instagram_url_safe,
-            downloader=download_instagram_media,
-            post_factory=extract_instagram_post,
-            card_view_factory=InstagramCardView,
-            fallback_view_factory=lambda url: InstagramControlView(original_url=url, timeout=604800),
-            compressor=compress_video_to_limit_safe,
-            semaphore=media_semaphore,
-            config=media_config,
-            default_media_label="media",
-            include_details=include_media_details,
-            ownership_recorder=state.record_message_ownership,
-            delete_source=False,
-        )
-        links_processed += instagram_processed
-        successful_replacements += instagram_processed
-
-    # Process YouTube links
-    if youtube_matches:
-        if not runtime_state.allow_user_action(message.author.id, "youtube", RATE_LIMIT_SECONDS):
-            logger.info(f"User {message.author} is rate limited for YouTube link.")
-            return
-        youtube_urls = [match.group(0) for match in youtube_matches]
-        logger.info(f"Processing YouTube links from {message.author} (ID: {message.id}) with URLs: {youtube_urls}")
-        youtube_processed = await process_native_media_links(
-            message=message,
-            urls=youtube_urls,
-            source_name="YouTube",
-            platform_key="youtube",
-            icon=YOUTUBE_ICON,
-            url_validator=validate_youtube_url_safe,
-            downloader=download_youtube_video,
-            post_factory=extract_youtube_post,
-            card_view_factory=YouTubeCardView,
-            fallback_view_factory=lambda url: YouTubeControlView(original_url=url, timeout=604800),
-            compressor=compress_video_to_limit_safe,
-            semaphore=media_semaphore,
-            config=media_config,
-            include_details=include_media_details,
-            ownership_recorder=state.record_message_ownership,
-            delete_source=False,
-        )
-        links_processed += youtube_processed
-        successful_replacements += youtube_processed
-
-    # Delete once, after every supported link has been sent and ownership saved.
-    if expected_replacements > 0 and successful_replacements == expected_replacements:
-        await maybe_delete_original_message(message, "social media")
-
-# Run the bot
 if __name__ == "__main__":
     client.run(TOKEN)

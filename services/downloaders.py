@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import glob
 import logging
 import os
 import tempfile
@@ -14,6 +13,12 @@ logger = logging.getLogger(__name__)
 
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "avif", "heic", "heif"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "m4v", "webm", "mkv", "avi", "flv", "wmv"}
+MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
+
+
+def _limit_download(progress):
+    if max(progress.get("downloaded_bytes") or 0, progress.get("total_bytes") or 0) > MAX_DOWNLOAD_BYTES:
+        raise yt_dlp.utils.DownloadError("Media exceeds download budget")
 
 
 @dataclass(frozen=True)
@@ -33,6 +38,11 @@ def _build_opts(output_folder: str, use_nvidia_gpu: bool) -> dict:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "socket_timeout": 20,
+        "retries": 2,
+        "fragment_retries": 2,
+        "max_filesize": MAX_DOWNLOAD_BYTES,
+        "progress_hooks": [_limit_download],
     }
     if use_nvidia_gpu:
         opts["postprocessors"] = [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}]
@@ -84,6 +94,8 @@ def download_media(
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             metadata = ydl.extract_info(media_url, download=False) or {}
+            if metadata.get("is_live") or metadata.get("entries") is not None:
+                return DownloadResult(success=False, error="Live streams and multi-item posts require a complete media set")
             title = metadata.get("title") or "Unknown Title"
             if download_subtitles:
                 subtitle_language = _select_subtitle_language(metadata)
@@ -101,15 +113,16 @@ def download_media(
             title = str(merged_metadata.get("title") or title or "Unknown Title")
             filepath = ydl.prepare_filename(info)
             if not os.path.exists(filepath):
-                video_id = info.get("id", "")
-                matches = glob.glob(f"{output_folder}/{video_id}.*")
-                if matches:
-                    filepath = matches[0]
+                candidates = [info.get("filepath")]
+                candidates.extend(item.get("filepath") for item in info.get("requested_downloads", []) if isinstance(item, dict))
+                completed = [p for p in candidates if p and Path(p).is_file() and Path(p).suffix.lstrip(".").lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS]
+                if len(set(completed)) == 1:
+                    filepath = completed[0]
                 else:
                     return DownloadResult(
                         success=False,
                         title=title,
-                        error=f"Downloaded file missing for {video_id}",
+                        error="Completed media file missing",
                         metadata=merged_metadata,
                     )
             transcript = _consume_downloaded_subtitle(merged_metadata, filepath, output_folder)

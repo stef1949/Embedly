@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from typing import Awaitable, Callable, Optional, Protocol
@@ -8,10 +9,18 @@ import discord
 
 from persistence import MessageOwnership
 from security import can_manage_bot_message
+from services.worker import operation_timeout
 from social_cards import ABOUT_EMBEDLY_URL, SocialPost, placeholder_post
 from tiktok_handler import TIKTOK_ABOUT_URL, TikTokPost, escape_discord_text
 
 logger = logging.getLogger(__name__)
+
+
+def _card_heading(icon: str, post: TikTokPost | SocialPost) -> str:
+    heading = f"{icon} {post.creator_display}"
+    if post.title:
+        heading += f"\n\n**{escape_discord_text(post.title)}**"
+    return heading
 
 _IsAdminFn = Callable[[int], bool]
 _FetchUserFn = Callable[[int], Awaitable[discord.User]]
@@ -100,8 +109,82 @@ async def _safe_ephemeral_response(interaction: discord.Interaction, content: st
     )
 
 
+async def _delete_control(interaction: discord.Interaction, fallback_owner=None, live_message=None) -> None:
+    # Acknowledge before any potentially slow Discord request or ownership lookup.
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except discord.HTTPException:
+        logger.warning("Could not acknowledge delete interaction; message preserved")
+        return
+
+    message = interaction.message
+    result = "You are not allowed to delete this message."
+    removed = False
+    if message is not None:
+        ownership = _lookup_ownership(message, interaction)
+        owner = ownership.original_author_id if ownership else _fallback_owner_id(fallback_owner)
+        if _is_admin is not None and can_manage_bot_message(interaction, owner, is_bot_admin=_is_admin):
+            try:
+                async with operation_timeout(30):
+                    # A live WebhookMessage retains the token needed to delete an
+                    # emulated post without Manage Messages permission.
+                    if isinstance(live_message, discord.WebhookMessage) and live_message.id == message.id:
+                        await live_message.delete()
+                    else:
+                        try:
+                            await message.delete()
+                        except discord.Forbidden:
+                            if not message.webhook_id:
+                                raise
+                            # After restart the interaction contains a plain Message.
+                            # Fetch only the specific webhook that published it.
+                            webhook = await interaction.client.fetch_webhook(message.webhook_id)
+                            if (webhook.channel_id != message.channel.id or not webhook.token
+                                    or webhook.user is None
+                                    or webhook.user.id != interaction.client.user.id):
+                                raise ValueError("Webhook ownership could not be verified")
+                            await webhook.delete_message(message.id)
+                removed = True
+                result = "Message deleted."
+            except discord.NotFound as exc:
+                if exc.code == 10008:  # Unknown Message, not Unknown Webhook/Interaction.
+                    removed = True
+                    result = "Message already deleted."
+                else:
+                    result = "I couldn't access this message's webhook. The message was not confirmed deleted."
+            except discord.Forbidden:
+                result = "I don't have permission to delete this message."
+            except (discord.HTTPException, asyncio.TimeoutError, ValueError) as exc:
+                logger.warning("Delete failed (%s, HTTP status=%s, Discord code=%s)",
+                               type(exc).__name__, getattr(exc, "status", None), getattr(exc, "code", None))
+                result = "I couldn't confirm deletion. Please try again."
+
+    if removed and _state is not None:
+        try:
+            # Keep the publication ledger: retrying the source must not recreate
+            # a replacement the user deliberately removed.
+            _state.delete_message_ownership(message.id)
+        except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Could not delete ownership record (%s)", type(exc).__name__)
+            result += " Ownership cleanup could not be saved."
+    try:
+        await interaction.edit_original_response(content=result, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        logger.warning("Could not deliver private delete result")
+
+
+class _CardDeleteButton(discord.ui.Button):
+    def __init__(self, platform_key: str) -> None:
+        super().__init__(label="Delete", style=discord.ButtonStyle.danger,
+                         custom_id=f"embedly:{platform_key}:delete")
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if self.view is not None:
+            await _delete_control(interaction, self.view.original_author_id, self.view.message)
+
+
 class BaseControlView(discord.ui.View):
-    def __init__(self, timeout: float | None = 604800):
+    def __init__(self, timeout: float | None = None):
         super().__init__(timeout=timeout)
         self.message = None
         self.original_author_id = None
@@ -130,23 +213,7 @@ class BaseControlView(discord.ui.View):
 class MessageControlView(BaseControlView):
     @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, custom_id="delete_button")
     async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            author_id = self._resolve_author_id(interaction.message, interaction)
-            if not self._can_manage(interaction, author_id):
-                await interaction.response.send_message("You are not allowed to delete this message.", ephemeral=True)
-                return
-            await interaction.message.delete()
-            if _state is not None:
-                try:
-                    _state.delete_message_ownership(interaction.message.id)
-                except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
-                    logger.warning("Could not delete ownership record (%s)", type(exc).__name__)
-            await interaction.response.send_message("Message deleted.", ephemeral=True)
-        except discord.NotFound:
-            await interaction.response.send_message("Message already deleted.", ephemeral=True)
-        except Exception as e:
-            logger.error("Delete button error: %s", e)
-            await interaction.response.send_message("Error processing request.", ephemeral=True)
+        await _delete_control(interaction, self.original_author_id, self.message)
 
     @discord.ui.button(label="Toggle Emulation", style=discord.ButtonStyle.secondary, custom_id="toggle_emulation")
     async def toggle_emulation_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -174,28 +241,12 @@ class MessageControlView(BaseControlView):
 
 
 class MediaControlView(BaseControlView):
-    def __init__(self, original_url: str, timeout: float | None = 604800):
+    def __init__(self, original_url: str, timeout: float | None = None):
         super().__init__(timeout=timeout)
         self.add_item(discord.ui.Button(label="Open Link", style=discord.ButtonStyle.link, url=original_url))
 
     async def _handle_delete(self, interaction: discord.Interaction):
-        try:
-            author_id = self._resolve_author_id(interaction.message, interaction)
-            if not self._can_manage(interaction, author_id):
-                await interaction.response.send_message("You are not allowed to delete this message.", ephemeral=True)
-                return
-            await interaction.message.delete()
-            if _state is not None:
-                try:
-                    _state.delete_message_ownership(interaction.message.id)
-                except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
-                    logger.warning("Could not delete ownership record (%s)", type(exc).__name__)
-            await interaction.response.send_message("Message deleted.", ephemeral=True)
-        except discord.NotFound:
-            await interaction.response.send_message("Message already deleted.", ephemeral=True)
-        except Exception as e:
-            logger.error("Media delete button error: %s", e)
-            await interaction.response.send_message("Error processing request.", ephemeral=True)
+        await _delete_control(interaction, self.original_author_id, self.message)
 
 
 class TikTokControlView(MediaControlView):
@@ -251,7 +302,8 @@ class TikTokCardView(discord.ui.LayoutView):
         post: TikTokPost,
         media: str | discord.File,
         icon: str,
-        timeout: float | None = 604800,
+        include_details: bool = False,
+        timeout: float | None = None,
     ) -> None:
         super().__init__(timeout=timeout)
         self.message: discord.Message | None = None
@@ -270,9 +322,10 @@ class TikTokCardView(discord.ui.LayoutView):
         controls = discord.ui.ActionRow(
             _TikTokInformationButton(),
             _TikTokTranscriptButton(),
+            _CardDeleteButton("tiktok"),
         )
         container = discord.ui.Container(
-            discord.ui.TextDisplay(f"{icon} {post.creator_display}"),
+            discord.ui.TextDisplay(_card_heading(icon, post)),
             discord.ui.MediaGallery(
                 discord.MediaGalleryItem(media=media, description=gallery_description)
             ),
@@ -403,7 +456,7 @@ class SocialMediaCardView(discord.ui.LayoutView):
         media: str | discord.File | None = None,
         spoiler: bool = False,
         include_details: bool = False,
-        timeout: float | None = 604800,
+        timeout: float | None = None,
     ) -> None:
         super().__init__(timeout=timeout)
         self.message: discord.Message | None = None
@@ -412,7 +465,7 @@ class SocialMediaCardView(discord.ui.LayoutView):
         self.transcript = post.transcript
 
         children: list[discord.ui.Item] = [
-            discord.ui.TextDisplay(f"{icon} {post.creator_display}"),
+            discord.ui.TextDisplay(_card_heading(icon, post)),
         ]
         if media is not None:
             gallery_description = None
@@ -439,6 +492,7 @@ class SocialMediaCardView(discord.ui.LayoutView):
             discord.ui.ActionRow(
                 _SocialInformationButton(post.platform_key),
                 _SocialTranscriptButton(post.platform_key),
+                _CardDeleteButton(post.platform_key),
             )
         )
         self.add_item(
@@ -509,7 +563,7 @@ class InstagramCardView(SocialMediaCardView):
         media: str | discord.File,
         icon: str,
         include_details: bool = False,
-        timeout: float | None = 604800,
+        timeout: float | None = None,
     ) -> None:
         super().__init__(
             post=post,
@@ -537,7 +591,7 @@ class YouTubeCardView(SocialMediaCardView):
         media: str | discord.File,
         icon: str,
         include_details: bool = False,
-        timeout: float | None = 604800,
+        timeout: float | None = None,
     ) -> None:
         super().__init__(
             post=post,
@@ -563,10 +617,12 @@ class TwitterCardView(SocialMediaCardView):
         *,
         post: SocialPost,
         icon: str,
+        media: str | discord.File | None = None,
+        include_details: bool = False,
         spoiler: bool = False,
-        timeout: float | None = 604800,
+        timeout: float | None = None,
     ) -> None:
-        super().__init__(post=post, icon=icon, spoiler=spoiler, timeout=timeout)
+        super().__init__(post=post, media=media, icon=icon, spoiler=spoiler, include_details=include_details, timeout=timeout)
 
     @classmethod
     def persistent_placeholder(cls) -> "TwitterCardView":

@@ -3,16 +3,16 @@
   <h1>Embedly Bot</h1>
 </div>
 
-This Discord bot replaces supported social links with native Discord Components V2 cards. It downloads TikTok, Instagram, and YouTube media for attachment-backed Media Galleries, and presents Twitter/X links as native link cards with a safe `vxtwitter.com` fallback. It includes interactive post details, caption-backed transcripts where available, restart-safe authorization, legacy controls, and comprehensive admin commands.
+This Discord bot replaces supported social links with native Discord Components V2 cards. It downloads and validates Twitter/X, TikTok, Instagram, and YouTube media before publishing attachment-backed Media Galleries. It includes interactive post details, caption-backed transcripts where available, restart-safe authorization, legacy controls, and comprehensive admin commands.
 
 ## Features
 
 ### Core Functionality
-* **Native social cards:** Twitter/X, TikTok, Instagram, and YouTube use Discord Components V2 containers with creator attribution, original-post and Embedly links, compact engagement data when available, information controls, and transcript controls
-* **Attachment-backed media:** TikTok, Instagram, and YouTube downloads are uploaded once and referenced by the card's native Media Gallery
-* **Twitter/X fallback:** Native Twitter/X link cards retain the validated `vxtwitter.com` rewrite/webhook path as a fallback
+* **Native social cards:** Twitter/X, TikTok, Instagram, and YouTube use Discord Components V2 containers with creator attribution, original-post and Embedly links, compact engagement data when available, information, transcript, and owner-authorized Delete controls
+* **Attachment-backed media:** Twitter/X, TikTok, Instagram, and YouTube downloads are uploaded once and referenced by the card's native Media Gallery
+* **Fail-closed publication:** Failed downloads, invalid media, timeouts, and rejected uploads never generate fallback links or public errors
 * **Safe Original Deletion:** Deletes the original post only after every detected supported link has a successful replacement and its ownership has been saved. Failed or partially completed posts remain available.
-* **User Emulation:** Can post links either as the original user (with their name and avatar) or as the bot with attribution
+* **User Emulation:** Can post media cards either as the original user (with their name and avatar) or as the bot with attribution
 * **Interactive Buttons:**
    * **Information / Transcript:** Native cards return trusted post details and available captions ephemerally
    * **Legacy Delete / Toggle Emulation:** Existing fallback views retain their owner-authorized controls
@@ -181,17 +181,27 @@ The bot supports these environment variables (with defaults):
 When you share a supported social link in a channel where the bot is active:
 
 * Cards use `discord.ui.LayoutView`, `Container`, `TextDisplay`, `MediaGallery`, `Separator`, and `ActionRow`
-* TikTok, Instagram, and YouTube cards contain a playable attachment-backed Media Gallery. Twitter/X is link-only because Embedly's Twitter path does not download tweet media
+* All four platforms require a validated attachment before a Media Gallery card is published. Image decoding and video probing/decoding require Pillow and FFmpeg/ffprobe. Missing validators preserve the original.
+* H.264, HEVC/H.265, VP8, VP9, and AV1 video streams are accepted after decode validation. HEVC media within the upload limit is uploaded unchanged; oversized video still uses the configured compression path. Playback depends on the receiving Discord client.
 * Cards include the available creator name and linked handle/profile, original-post and Embedly links, and compact platform statistics such as `♥ 1.2K   💬 6.2K   ▶ 1M`
 * The information button shows validated metadata that is available, such as description, post date, duration, and dimensions
 * `/media_details enable:true` adds an inline date/duration/dimensions summary to Instagram and YouTube cards when those values are available; the information button remains available either way
-* TikTok, Instagram, and YouTube request an existing subtitle/caption track from yt-dlp. Embedly does not use speech-to-text, a paid cloud API, bundled speech models, or automatic model downloads. Twitter/X has no transcript source in its link-only path. Missing captions produce `Transcript unavailable for this post`
+* TikTok, Instagram, and YouTube request an existing subtitle/caption track from yt-dlp. Embedly does not use speech-to-text, a paid cloud API, bundled speech models, or automatic model downloads. Twitter/X displays available downloaded metadata. Missing captions produce `Transcript unavailable for this post`
 * Bot-authored native cards are sent as replies with `mention_author=False`, so Discord can retain the reply reference and show its original-message-deleted indicator. Emulated Twitter/X cards use a webhook with your name and avatar; webhook posts do not include a reply reference
 * When one source message contains several supported links, all replacements are sent and recorded before the source is deleted once. This avoids duplicate deletion attempts and preserves the source if any replacement cannot be secured
-* Native Components V2 sends never mix `view=` with legacy `content=` or `embed=`. Legacy fields are used only by a fallback path
+* Native Components V2 sends never mix `view=` with legacy `content=` or `embed=`. Existing legacy post controls remain registered, but no new fallback posts are created.
 * Ownership recording uses Discord-issued message, channel, guild, and user IDs. If persistence fails, Embedly removes the unrecorded replacement when possible and preserves the source rather than inferring ownership from text, mentions, URLs, or handles
 
-**Fallbacks:** TikTok uses a validated `tnktok.com` link. Instagram and YouTube retain their validated original links. Twitter/X retains the validated `vxtwitter.com` rewrite and optional webhook-emulation path. The configured download timeout, upload limit, cleanup, and FFmpeg compression behavior still applies; oversized images cannot be video-compressed.
+**Download failures:** No replacement, fallback link, or public error is sent. The original message and embeds remain unchanged unless every required replacement was validated, published, and ownership-recorded. Oversized images, unsupported codecs, live streams, and multi-item downloader results are preserved rather than publishing an incomplete media set.
+
+**Private progress:** Ordinary incoming messages are not interactions and cannot receive ephemeral responses. Automatic processing is silent. The submitting user can choose **Apps → Download links** on their message to receive “Your link is being downloaded” ephemerally. This command joins an existing in-flight job when possible and resolves the private response with the outcome. A ten-minute deadline keeps completion within Discord's interaction-token lifetime; failures never become public notifications. Media replacements themselves are published in the original channel.
+
+**Source behavior:** `SOURCE_BEHAVIOR=delete` (default), `suppress`, or `keep` selects what happens after complete publication. `/server_settings source_behavior:…` overrides it for the current server, using the existing in-memory settings lifecycle. Neither deletion nor suppression runs after partial failure. The source is re-fetched before cleanup to avoid deleting newly edited content.
+
+**Retries:** Canonical duplicate links are processed once. SQLite publication records are committed together with ownership, so retries and restarts skip successful links. A send timeout, uncertain server error, or failed ownership rollback leaves a pending record and preserves the original. Such records deliberately block automatic retries: an operator must first inspect the channel and reconcile/remove any unrecorded replacement before clearing its `link_publications` pending record. Do not clear pending records blindly. Publication records are retained separately from expiring button-ownership records.
+
+**Resource limits:** Each media job uses its own temporary directory. Download/probe/transcode work runs in a subprocess; timeout or cancellation kills the process group before directory cleanup and capacity release on POSIX. Windows uses `taskkill /T /F` for timed-out jobs. Downloads have a 256 MiB transfer budget, bounded network retries, and a separate configurable upload limit. Validation and publication have deadlines as well.
+
 
 ### Instagram Media Downloads
 When you share an Instagram link (posts, reels, IGTV) in a channel where the bot is active:
@@ -246,22 +256,22 @@ export USE_NVIDIA_GPU=true
 **Note:** If hardware encoding fails (e.g., GPU not available or FFmpeg lacks NVENC support), the bot will fall back to CPU-based encoding. Check the bot logs for encoding status messages.
 
 ### User Emulation
-The preference applies to both native Twitter/X cards and their rewrite fallback:
+The preference applies to attachment-backed cards for all four supported platforms:
 * **Emulation Enabled:** Posts use your name and avatar through a webhook
-* **Emulation Disabled:** Native cards appear as bot replies; fallback links include attribution
+* **Emulation Disabled:** Cards appear as bot replies with explicit submitter attribution
 
-Both paths save trusted ownership before the original post is deleted.
+Both identities save trusted ownership before source cleanup. If a webhook send fails, the bot preserves the source instead of attempting a second send under another identity.
 
 You can toggle your preference with:
 * The `/emulate` command
-* The "Toggle Emulation" button on legacy fallback posts
+* The "Toggle Emulation" button on older legacy posts
 
-**Note:** Emulation requires the bot to have webhook permissions in the channel. The bot will automatically fall back to non-emulation mode if these permissions are missing.
+**Note:** Emulation requires the bot to have webhook permissions in the channel. The bot reuses a usable webhook it owns, including renamed webhooks, and serializes creation per channel. If these permissions are missing or the channel has reached its webhook limit with no reusable bot-owned webhook, validated media is posted with bot attribution. A full channel is checked again after 60 seconds. Other owners’ webhooks are never reused or deleted. Emulation requires an available bot-owned webhook; a failed media send preserves the source.
 
 ### Managing Posts
-Native cards include information and transcript controls. Legacy fallback views retain these owner-authorized controls:
-* **Delete:** Removes the fallback post (only works for your own posts or if you're an admin)
-* **Toggle Emulation:** Switches your preference for future Twitter/X posts
+Native cards include information, transcript, and Delete controls. Delete acknowledges the click privately before removing the card, and clears ownership only after confirmed deletion. Emulated cards use their webhook when ordinary message deletion is forbidden. New cards have persistent controls without the previous seven-day timeout. Already-posted cards are not automatically edited to add missing buttons. Legacy fallback views retain these owner-authorized controls:
+* **Delete:** Removes the card or legacy post (only works for your own posts or if you're an admin)
+* **Toggle Emulation:** Switches your preference for future media cards
 
 ### Server Administration
 Server administrators can:
@@ -304,9 +314,9 @@ For native social cards:
 * Give the bot permission to attach files, send messages, read message history, and manage messages if source replacement is desired
 * Ensure `STATE_DATABASE_PATH` points to a writable location; ownership persistence failures deliberately preserve the source message
 * Emoji environment variables must contain a complete custom emoji mention and the bot must be able to use the emoji; malformed or empty configuration uses the platform's Unicode fallback
-* Check the log for yt-dlp, upload-limit, FFmpeg, timeout, or Components V2 errors when a fallback link appears
+* Check the log for yt-dlp, validation, upload-limit, FFmpeg, timeout, or Components V2 errors when a source remains unchanged
 * Transcript availability depends on the source and yt-dlp exposing a downloadable caption track. Embedly does not synthesize a transcript from audio
-* Twitter/X cards intentionally contain no Media Gallery or engagement totals because the existing Twitter/X integration only rewrites links and does not fetch trusted tweet metadata or media
+* Twitter/X requires downloadable, valid media; text-only or unavailable posts retain their original message and embed
 
 `STATE_DATABASE_PATH` stores Discord ownership coordinates plus rendered card information/transcript text needed by persistent callbacks. Protect this file as application data. Records older than `OWNERSHIP_RETENTION_DAYS` are removed by the hourly maintenance task. Existing bot messages created before this database was enabled have no trusted ownership row, so ordinary users are denied after a restart; server administrators and verified bot administrators retain their existing override behavior.
 
@@ -321,3 +331,7 @@ By using this bot, you agree to our:
 * [Security Policy](SECURITY.md) - How to report a vulnerability privately
 
 Please review these documents to understand your rights and responsibilities when using the bot.
+
+### Workflow regression tests
+
+Run `python -W error::ResourceWarning -m unittest discover -s tests` after installing requirements. Publication tests mock Discord and downloader responses but validate actual image bytes. Worker and video tests exercise local subprocesses and FFmpeg. These checks do not establish live Discord rendering, permissions, webhook delivery, or rate-limit behavior.

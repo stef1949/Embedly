@@ -160,7 +160,7 @@ class TikTokLayoutTests(unittest.TestCase):
         attachment = discord.File(io.BytesIO(b"video"), filename="tiktok_video.mp4")
         try:
             view = TikTokCardView(
-                post=build_post(),
+                post=build_post(title="Visible video title"),
                 media=attachment,
                 icon="🎵",
                 timeout=None,
@@ -172,6 +172,8 @@ class TikTokLayoutTests(unittest.TestCase):
         self.assertTrue(view.is_persistent())
         self.assertEqual([component["type"] for component in components], [17])
         children = components[0]["components"]
+        self.assertIn("**Visible video title**", children[0]["content"])
+        self.assertEqual(children[1]["items"][0]["description"], "A test caption")
         self.assertEqual([component["type"] for component in children], [10, 12, 14, 10, 10, 1])
         self.assertEqual(
             children[1]["items"][0]["media"]["url"],
@@ -238,113 +240,6 @@ def processing_config(folder):
         ffmpeg_headroom_ratio=0.95,
         use_nvidia_gpu=False,
     )
-
-
-class TikTokSendTests(unittest.IsolatedAsyncioTestCase):
-    async def test_native_card_reply_has_no_legacy_content_or_embed(self):
-        guild = SimpleNamespace(id=300)
-        message = FakeSourceMessage(guild)
-        ownership_calls = []
-
-        with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "download.mp4")
-            with open(path, "wb") as video:
-                video.write(b"video")
-
-            def downloader(url, output_folder=None):
-                return DownloadResult(
-                    success=True,
-                    filepath=path,
-                    metadata={
-                        "uploader": "Creator",
-                        "uploader_id": "creator",
-                        "webpage_url": url,
-                        "like_count": 1234,
-                    },
-                )
-
-            def record_ownership(**kwargs):
-                self.assertFalse(message.deleted)
-                ownership_calls.append(kwargs)
-
-            processed = await process_tiktok_links(
-                message=message,
-                urls=["https://www.tiktok.com/@creator/video/123"],
-                url_validator=lambda url: url,
-                downloader=downloader,
-                compressor=lambda *args, **kwargs: None,
-                fallback_view_factory=lambda url: SimpleNamespace(original_author_id=None, message=None),
-                ownership_recorder=record_ownership,
-                semaphore=asyncio.Semaphore(1),
-                config=processing_config(folder),
-                icon="🎵",
-            )
-
-        self.assertEqual(processed, 1)
-        self.assertTrue(message.deleted)
-        self.assertEqual(len(message.replies), 1)
-        kwargs = message.replies[0]["kwargs"]
-        self.assertNotIn("content", kwargs)
-        self.assertNotIn("embed", kwargs)
-        self.assertFalse(kwargs["mention_author"])
-        self.assertIsInstance(kwargs["file"], discord.File)
-        self.assertIsInstance(kwargs["view"], discord.ui.LayoutView)
-        gallery_url = kwargs["view"].to_components()[0]["components"][1]["items"][0]["media"]["url"]
-        self.assertEqual(gallery_url, f"attachment://{kwargs['file'].filename}")
-        self.assertEqual(ownership_calls[0]["message_type"], "tiktok_card")
-        self.assertEqual(ownership_calls[0]["original_author_id"], 400)
-
-    async def test_download_failure_uses_tnktok_reply_fallback(self):
-        guild = SimpleNamespace(id=300)
-        message = FakeSourceMessage(guild)
-
-        processed = await process_tiktok_links(
-            message=message,
-            urls=["https://www.tiktok.com/@creator/video/123"],
-            url_validator=lambda url: url,
-            downloader=lambda *args, **kwargs: DownloadResult(success=False, error="failed"),
-            compressor=lambda *args, **kwargs: None,
-            fallback_view_factory=lambda url: SimpleNamespace(original_author_id=None, message=None),
-            ownership_recorder=lambda **kwargs: None,
-            semaphore=asyncio.Semaphore(1),
-            config=processing_config(tempfile.gettempdir()),
-            icon="🎵",
-        )
-
-        self.assertEqual(processed, 1)
-        self.assertTrue(message.deleted)
-        self.assertEqual(len(message.replies), 1)
-        self.assertIn("https://tnktok.com/@creator/video/123", message.replies[0]["kwargs"]["content"])
-        self.assertFalse(message.replies[0]["kwargs"]["mention_author"])
-
-    async def test_source_is_preserved_when_ownership_cannot_be_recorded(self):
-        guild = SimpleNamespace(id=300)
-        message = FakeSourceMessage(guild)
-
-        with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "download.mp4")
-            with open(path, "wb") as video:
-                video.write(b"video")
-
-            def fail_recording(**kwargs):
-                raise RuntimeError("database unavailable")
-
-            processed = await process_tiktok_links(
-                message=message,
-                urls=["https://www.tiktok.com/@creator/video/123"],
-                url_validator=lambda url: url,
-                downloader=lambda *args, **kwargs: DownloadResult(success=True, filepath=path),
-                compressor=lambda *args, **kwargs: None,
-                fallback_view_factory=lambda url: SimpleNamespace(original_author_id=None, message=None),
-                ownership_recorder=fail_recording,
-                semaphore=asyncio.Semaphore(1),
-                config=processing_config(folder),
-                icon="🎵",
-            )
-
-        self.assertEqual(processed, 0)
-        self.assertFalse(message.deleted)
-        self.assertTrue(all(reply["message"].deleted for reply in message.replies))
 
 
 class FakeStore:

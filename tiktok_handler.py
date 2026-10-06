@@ -46,6 +46,7 @@ class TikTokPost:
     comment_count: int | None
     repost_count: int | None
     transcript: str | None
+    title: str | None = None
 
     @property
     def creator_display(self) -> str:
@@ -111,7 +112,15 @@ def extract_tiktok_post(result: DownloadResult, validated_url: str) -> TikTokPos
         comment_count=_count(metadata, ("comment_count", "comments_count")),
         repost_count=_count(metadata, ("repost_count", "share_count")),
         transcript=_extract_transcript(metadata, result.filepath),
+        title=downloaded_title(result),
     )
+
+
+def downloaded_title(result: DownloadResult) -> str | None:
+    title = _first_text(result.metadata, ("title",), 1000)
+    if not title and result.title and result.title != "Unknown Title":
+        title = result.title.strip()[:1000]
+    return title or _first_text(result.metadata, ("caption", "description"), 1000)
 
 
 def format_compact_number(value: int | float) -> str:

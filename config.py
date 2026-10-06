@@ -48,6 +48,7 @@ class BotConfig:
     twitter_emoji: str = DEFAULT_TWITTER_EMOJI
     youtube_emoji: str = ""
     ownership_retention_days: int = 30
+    source_behavior: str = "delete"
 
 
 
@@ -88,4 +89,5 @@ def load_config() -> BotConfig:
         twitter_emoji=os.getenv("TWITTER_EMOJI", DEFAULT_TWITTER_EMOJI),
         youtube_emoji=os.getenv("YOUTUBE_EMOJI", ""),
         ownership_retention_days=_get_int("OWNERSHIP_RETENTION_DAYS", 30, 1),
+        source_behavior=os.getenv("SOURCE_BEHAVIOR", "delete") if os.getenv("SOURCE_BEHAVIOR", "delete") in {"delete", "suppress", "keep"} else "delete",
     )

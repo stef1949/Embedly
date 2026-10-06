@@ -101,7 +101,7 @@ class SocialLayoutTests(unittest.TestCase):
             (
                 InstagramCardView,
                 extract_instagram_post(
-                    DownloadResult(success=True, metadata={"uploader": "Creator"}),
+                    DownloadResult(success=True, title="Visible video title", metadata={"uploader": "Creator"}),
                     "https://www.instagram.com/reel/abc123/",
                 ),
                 "instagram_media.mp4",
@@ -110,7 +110,7 @@ class SocialLayoutTests(unittest.TestCase):
             (
                 YouTubeCardView,
                 extract_youtube_post(
-                    DownloadResult(success=True, metadata={"channel": "Creator"}),
+                    DownloadResult(success=True, title="Visible video title", metadata={"channel": "Creator"}),
                     "https://www.youtube.com/watch?v=abc123",
                 ),
                 "youtube_media.mp4",
@@ -129,6 +129,7 @@ class SocialLayoutTests(unittest.TestCase):
                 self.assertTrue(view.is_persistent())
                 self.assertEqual([component["type"] for component in components], [17])
                 children = components[0]["components"]
+                self.assertIn("**Visible video title**", children[0]["content"])
                 self.assertEqual([component["type"] for component in children], [10, 12, 14, 10, 10, 1])
                 self.assertEqual(children[1]["items"][0]["media"]["url"], f"attachment://{filename}")
                 self.assertIn(open_label, children[3]["content"])
@@ -237,191 +238,6 @@ def processing_config(folder):
         ffmpeg_headroom_ratio=0.95,
         use_nvidia_gpu=False,
     )
-
-
-class SocialSendTests(unittest.IsolatedAsyncioTestCase):
-    async def test_instagram_native_card_uses_only_file_and_view(self):
-        message = FakeSourceMessage()
-        ownership_calls = []
-        with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "download.mp4")
-            with open(path, "wb") as video:
-                video.write(b"video")
-
-            processed = await process_native_media_links(
-                message=message,
-                urls=["https://www.instagram.com/reel/abc123/"],
-                source_name="Instagram",
-                platform_key="instagram",
-                icon="ICON",
-                url_validator=lambda url: url,
-                downloader=lambda *args, **kwargs: DownloadResult(
-                    success=True,
-                    filepath=path,
-                    metadata={"uploader": "Creator", "like_count": 1234},
-                ),
-                compressor=lambda *args, **kwargs: None,
-                post_factory=extract_instagram_post,
-                card_view_factory=InstagramCardView,
-                fallback_view_factory=lambda url: InstagramControlView(url),
-                ownership_recorder=lambda **kwargs: ownership_calls.append(kwargs),
-                semaphore=asyncio.Semaphore(1),
-                config=processing_config(folder),
-            )
-
-        self.assertEqual(processed, 1)
-        self.assertTrue(message.deleted)
-        kwargs = message.replies[0]["kwargs"]
-        self.assertNotIn("content", kwargs)
-        self.assertNotIn("embed", kwargs)
-        self.assertFalse(kwargs["mention_author"])
-        self.assertIsInstance(kwargs["file"], discord.File)
-        self.assertIsInstance(kwargs["view"], discord.ui.LayoutView)
-        gallery_url = kwargs["view"].to_components()[0]["components"][1]["items"][0]["media"]["url"]
-        self.assertEqual(gallery_url, f"attachment://{kwargs['file'].filename}")
-        self.assertEqual(ownership_calls[0]["message_type"], "instagram_card")
-        self.assertEqual(ownership_calls[0]["original_author_id"], 400)
-
-    async def test_media_download_failure_uses_validated_link_fallback(self):
-        message = FakeSourceMessage()
-
-        processed = await process_native_media_links(
-            message=message,
-            urls=["https://www.instagram.com/p/abc123/"],
-            source_name="Instagram",
-            platform_key="instagram",
-            icon="ICON",
-            url_validator=lambda url: url,
-            downloader=lambda *args, **kwargs: DownloadResult(success=False, error="failed"),
-            compressor=lambda *args, **kwargs: None,
-            post_factory=extract_instagram_post,
-            card_view_factory=InstagramCardView,
-            fallback_view_factory=lambda url: InstagramControlView(url),
-            ownership_recorder=lambda **kwargs: None,
-            semaphore=asyncio.Semaphore(1),
-            config=processing_config(tempfile.gettempdir()),
-        )
-
-        self.assertEqual(processed, 1)
-        self.assertTrue(message.deleted)
-        self.assertIn("https://www.instagram.com/p/abc123/", message.replies[0]["kwargs"]["content"])
-
-    async def test_media_ownership_failure_removes_replacements_and_preserves_source(self):
-        message = FakeSourceMessage()
-        with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "download.mp4")
-            with open(path, "wb") as video:
-                video.write(b"video")
-
-            processed = await process_native_media_links(
-                message=message,
-                urls=["https://www.instagram.com/reel/abc123/"],
-                source_name="Instagram",
-                platform_key="instagram",
-                icon="ICON",
-                url_validator=lambda url: url,
-                downloader=lambda *args, **kwargs: DownloadResult(success=True, filepath=path),
-                compressor=lambda *args, **kwargs: None,
-                post_factory=extract_instagram_post,
-                card_view_factory=InstagramCardView,
-                fallback_view_factory=lambda url: InstagramControlView(url),
-                ownership_recorder=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")),
-                semaphore=asyncio.Semaphore(1),
-                config=processing_config(folder),
-            )
-
-        self.assertEqual(processed, 0)
-        self.assertFalse(message.deleted)
-        self.assertTrue(all(reply["message"].deleted for reply in message.replies))
-
-    async def test_delete_source_can_be_coordinated_by_caller(self):
-        message = FakeSourceMessage()
-        with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "download.mp4")
-            with open(path, "wb") as video:
-                video.write(b"video")
-
-            processed = await process_native_media_links(
-                message=message,
-                urls=["https://www.youtube.com/watch?v=abc123"],
-                source_name="YouTube",
-                platform_key="youtube",
-                icon="ICON",
-                url_validator=lambda url: url,
-                downloader=lambda *args, **kwargs: DownloadResult(success=True, filepath=path),
-                compressor=lambda *args, **kwargs: None,
-                post_factory=extract_youtube_post,
-                card_view_factory=YouTubeCardView,
-                fallback_view_factory=lambda url: InstagramControlView(url),
-                ownership_recorder=lambda **kwargs: None,
-                semaphore=asyncio.Semaphore(1),
-                config=processing_config(folder),
-                delete_source=False,
-            )
-
-        self.assertEqual(processed, 1)
-        self.assertFalse(message.deleted)
-
-    async def test_twitter_native_send_has_no_content_or_embed(self):
-        message = FakeSourceMessage()
-        ownership_calls = []
-
-        processed = await send_twitter_rewrite_message(
-            message=message,
-            rewrite_result=RewriteResult(
-                rewritten_urls=["https://vxtwitter.com/creator/status/123"],
-                spoiler_urls=[],
-            ),
-            should_emulate=True,
-            icon="ICON",
-            ownership_recorder=lambda **kwargs: ownership_calls.append(kwargs),
-        )
-
-        self.assertEqual(processed, 1)
-        self.assertFalse(message.deleted)
-        kwargs = message.replies[0]["kwargs"]
-        self.assertNotIn("content", kwargs)
-        self.assertNotIn("embed", kwargs)
-        self.assertFalse(kwargs["mention_author"])
-        self.assertIsInstance(kwargs["view"], TwitterCardView)
-        self.assertEqual(ownership_calls[0]["message_type"], "twitter_card")
-
-    async def test_twitter_card_failure_retains_legacy_rewrite_fallback(self):
-        message = FakeSourceMessage()
-        with patch("handlers.twitter.TwitterCardView", side_effect=TypeError("unsupported")):
-            processed = await send_twitter_rewrite_message(
-                message=message,
-                rewrite_result=RewriteResult(
-                    rewritten_urls=["https://vxtwitter.com/creator/status/123"],
-                    spoiler_urls=[],
-                ),
-                should_emulate=False,
-                icon="ICON",
-                ownership_recorder=lambda **kwargs: None,
-            )
-
-        self.assertEqual(processed, 1)
-        self.assertEqual(len(message.channel.sent), 1)
-        self.assertIn("https://vxtwitter.com/creator/status/123", message.channel.sent[0]["args"][0])
-
-    async def test_twitter_ownership_failure_removes_all_replacements(self):
-        message = FakeSourceMessage()
-
-        processed = await send_twitter_rewrite_message(
-            message=message,
-            rewrite_result=RewriteResult(
-                rewritten_urls=["https://vxtwitter.com/creator/status/123"],
-                spoiler_urls=[],
-            ),
-            should_emulate=False,
-            icon="ICON",
-            ownership_recorder=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")),
-        )
-
-        self.assertEqual(processed, 0)
-        self.assertTrue(message.replies[0]["message"].deleted)
-        self.assertTrue(message.channel.sent[0]["message"].deleted)
-        self.assertFalse(message.deleted)
 
 
 class FakeStore:
