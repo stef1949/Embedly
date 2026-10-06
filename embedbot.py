@@ -85,7 +85,7 @@ user_media_details_preferences = {}  # Maps user ID to boolean preference
 # Bot statistics
 bot_start_time = time.time()
 links_processed = 0
-version = "2.0.0"  # Bot version
+version = "2.2.0"  # Bot version
 
 # Security settings
 GLOBAL_RATE_LIMIT = CONFIG.global_rate_limit_per_minute  # Maximum requests per minute across all users
